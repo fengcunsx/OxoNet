@@ -5,7 +5,7 @@ from torch.utils.data import Dataset, Sampler, DataLoader
 import numpy as np
 import torch
 
-from dataset.generate_paire import generate_pair
+from dataset.generate_paire import generate_pair, combine_data
 
 BASE_DICT = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
@@ -84,7 +84,7 @@ def collate_fn(batch):
         "std": torch.stack([b["std"] for b in batch]),
         "dwell": torch.stack([b["dwell"] for b in batch]),
         "labels": torch.tensor([b["label"] for b in batch]),  # 用 7mer id 作为类别
-        'sig_l' : torch.stack([b['sig_l'] for b in batch]),
+        'sig_l': torch.stack([b['sig_l'] for b in batch]),
         "read_id": [b["read_id"] for b in batch],
         "position": [b["position"] for b in batch],
     }
@@ -125,14 +125,68 @@ def get_dataset(pos_dir, neg_dir, save_dir, epoch, kmer=5, n_threads=8, generate
     return PairDataset(pos_file, neg_file)
 
 
+class TestDataset(Dataset):
+    def __init__(self, file):
+        super().__init__()
+        # 只在主进程加载
+        data = np.load(file, allow_pickle=False, mmap_mode=None)
+
+        # 转 torch tensor 方便后续
+        self.signal = torch.from_numpy(data["signal"]).float()
+        self.mean = torch.from_numpy(data["mean"]).float()
+        self.std = torch.from_numpy(data["std"]).float()
+        self.dwell = torch.from_numpy(data["dwell"]).float()
+        self.kmer = self.encode_kmers(data["kmers"])
+        self.readid = data["read_id"]
+        self.pos = data["basecall_pos"]
+        self.label = data['label']
+
+        self.n = self.signal.shape[0]
+
+    def encode_kmers(self, kmer_array):
+        return np.stack([
+            np.fromiter((BASE_DICT[ch] for ch in s), dtype=np.int64, count=len(s))
+            for s in kmer_array
+        ])
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        sig_l = self.dwell[idx].sum().item()
+        return {
+            "signal": self.signal[idx].reshape(-1, 1),
+            "kmer": torch.tensor(self.kmer[idx], dtype=torch.long),
+            "mean": self.mean[idx].reshape(-1, 1),
+            "std": self.std[idx].reshape(-1, 1),
+            "dwell": self.dwell[idx].reshape(-1, 1),
+            "sig_l": torch.tensor(sig_l),
+            "read_id": self.readid[idx],
+            "position": self.pos[idx],
+            "label": self.label[idx],
+        }
+
+
+def get_test_dataset(pos_dir, neg_dir, save_dir, generate=False):
+    file_pth = os.path.join(save_dir, 'test.npz')
+    if generate or os.path.exists(file_pth):
+        combine_data(pos_dir, neg_dir, file_pth)
+    return TestDataset(file_pth)
+
+
 if __name__ == "__main__":
-    pos_file = '../exp/samples/pos.npz'
-    neg_file = '../exp/samples/neg.npz'
-    batch_size = 32
-    dataset = PairDataset(pos_file, neg_file)
-    dataloader = DataLoader(dataset, batch_size=batch_size,
-                            sampler=MultiSimSampler(len(dataset) // 2, n_sample=batch_size, shuffle=True),
-                            collate_fn=collate_fn, num_workers=8)
-    print(len(dataloader))
-    for batch in dataloader:
-        print(type(batch))
+    # pos_file = '../exp/samples/pos.npz'
+    # neg_file = '../exp/samples/neg.npz'
+    # batch_size = 32
+    # dataset = PairDataset(pos_file, neg_file)
+    # dataloader = DataLoader(dataset, batch_size=batch_size,
+    #                         sampler=MultiSimSampler(len(dataset) // 2, n_sample=batch_size, shuffle=True),
+    #                         collate_fn=collate_fn, num_workers=8)
+    # print(len(dataloader))
+    # for batch in dataloader:
+    #     print(type(batch))
+
+    pos_dir = '/home/bio/8oxog/data/feature/8oxog_test'
+    neg_dir = '/home/bio/8oxog/data/feature/g_test'
+    save_dir = '/home/bio/8oxog/data/feature'
+    get_test_dataset(pos_dir, neg_dir, save_dir, generate=True)

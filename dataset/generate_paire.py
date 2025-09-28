@@ -98,6 +98,28 @@ def generate_pair(pos_dir, neg_dir, save_dir, kmer, epoch=0, n_threads=8):
         shutil.rmtree(neg_workspace)
 
 
+def combine_data(pos_dir, neg_dir, save_file):
+    files = []
+    for file in os.listdir(pos_dir):
+        files.append(os.path.join(pos_dir, file))
+        files.append(os.path.join(neg_dir, file))
+
+    data = np.load(files[0])
+    keys = data.files
+
+    merged = {k: [] for k in keys}
+
+    # 依次读取并存储
+    for f in files:
+        npz = np.load(f)
+        for k in keys:
+            merged[k].append(npz[k])
+
+    # 拼接并保存
+    merged = {k: np.concatenate(v, axis=0) for k, v in merged.items()}
+    np.savez(save_file, **merged)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--pos_dir', type=str, default='../exp/split/8oxog_train')
@@ -107,4 +129,4 @@ if __name__ == '__main__':
     parser.add_argument('--kmer', type=int, default=5)
     args = parser.parse_args()
 
-    generate_pair(args.pos_dir, args.neg_dir,args.save_dir, args.kmer,  n_threads=args.n_threads)
+    generate_pair(args.pos_dir, args.neg_dir, args.save_dir, args.kmer, n_threads=args.n_threads)

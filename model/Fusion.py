@@ -1,5 +1,6 @@
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 
 
 class Fusion(nn.Module):
@@ -7,6 +8,7 @@ class Fusion(nn.Module):
         super(Fusion, self).__init__()
         self.cross_attention = nn.MultiheadAttention(embed_dim=dim, num_heads=mha_dim, dropout=dropout,
                                                      batch_first=True)
+        self.mid = seq_l // 2
         self.norm = nn.LayerNorm(dim)
         self.dim = dim * seq_l
         self.ffn = nn.Sequential(
@@ -23,9 +25,11 @@ class Fusion(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, sig_feat, seq_feat,sig_mask=None):
+    def forward(self, sig_feat, seq_feat, sig_mask=None):
         mask = (~sig_mask) if (sig_mask is not None) else None
-        attn_out = self.norm(self.cross_attention(query=seq_feat, key=sig_feat, value=sig_feat,key_padding_mask=mask)[0])
-        feat = self.ffn(attn_out)
-        prob = self.pred_head(feat)
+        attn_out = self.norm(
+            self.cross_attention(query=seq_feat, key=sig_feat, value=sig_feat, key_padding_mask=mask)[0])
+        # feat = self.ffn(attn_out)
+        feat = F.normalize(attn_out[:, self.mid, :], p=2, dim=-1)
+        prob = self.pred_head(self.ffn(attn_out))
         return feat, prob
