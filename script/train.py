@@ -191,9 +191,9 @@ def train(args: argparse.Namespace):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--resume', type=str, default='../model_save_lr_schedule_feta/model_59.pth')
+    parser.add_argument('--resume', type=str, default='../model_save_lr_schedule_feta/model_68.pth')
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--resume_epoch', type=int, default=60)
+    parser.add_argument('--resume_epoch', type=int, default=80)
     parser.add_argument('--pos-dir', type=str, default='/home/bio/8oxog/data/feature/8oxog_train')
     parser.add_argument('--neg-dir', type=str, default='/home/bio/8oxog/data/feature/g_train')
     parser.add_argument('--work-dir', type=str, default='/home/bio/8oxog/data/feature/workspace')
