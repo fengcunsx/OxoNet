@@ -8,6 +8,7 @@ import torch
 from dataset.generate_paire import generate_pair, combine_data
 
 BASE_DICT = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+DEBASE_DICT = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
 
 
 class PairDataset(Dataset):
@@ -170,6 +171,7 @@ class TestDataset(Dataset):
 def get_test_dataset(pos_dir, neg_dir, save_dir, generate=False):
     file_pth = os.path.join(save_dir, 'test.npz')
     if generate or os.path.exists(file_pth):
+        os.makedirs(save_dir, exist_ok=True)
         combine_data(pos_dir, neg_dir, file_pth)
     return TestDataset(file_pth)
 

@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch
 
-from model.Fusion import Fusion
+from model.Fusion import Fusion, PredHead
 from model.seqencoder import SeqEncoder
 from model.signalencoder import SignalEncoder
 
@@ -12,10 +12,11 @@ class DetectModel(nn.Module):
         self.signal_encoder = SignalEncoder(out_channel=dim, dropout=dropout, block_count=sig_blocks, sig_l=sig_l)
         self.seq_encoder = SeqEncoder(out_channel=dim)
         self.connected = Fusion(dim=dim, dropout=dropout, seq_l=seq_l)
+        # self.connected = PredHead(input_dim=dim)
 
-    def forward(self, signal, mean, std, dwell, seq, sig_l):
+    def forward(self, signal, seq, sig_l):
         signal, mask = self.signal_encoder(signal, sig_l)
-        base_stat = torch.cat((mean, std, dwell), dim=-1)
-        seq = self.seq_encoder(base_stat, seq)
+        seq = self.seq_encoder(seq)
         feat, prob = self.connected(signal, seq, mask)
+        # feat, prob = self.connected(signal, mask)
         return feat, prob

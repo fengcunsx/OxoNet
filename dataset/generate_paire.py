@@ -99,6 +99,7 @@ def generate_pair(pos_dir, neg_dir, save_dir, kmer, epoch=0, n_threads=8):
 
 
 def combine_data(pos_dir, neg_dir, save_file):
+    # os.makedirs(save_file, exist_ok=True)/
     files = []
     for file in os.listdir(pos_dir):
         files.append(os.path.join(pos_dir, file))
