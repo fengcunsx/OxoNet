@@ -92,21 +92,28 @@ def collate_fn(batch):
 
 
 class MultiSimSampler(Sampler):
-    def __init__(self, n, n_sample, shuffle=True):
+    def __init__(self, n, n_sample, shuffle=True, seed=42):
         super().__init__()
         # data must be a pair
         self.n = n
         assert n_sample % 2 == 0
         self.batch_size = n_sample // 2
         self.shuffle = shuffle
-
+        self.epoch = 0
         # total data count is 2n
         self.all_classes = list(range(n))
+        self.seed = seed
+
+    def set_epoch(self, epoch):  # ← 加这个方法
+        self.epoch = epoch
 
     def __iter__(self):
         classes = self.all_classes[:]
         if self.shuffle:
-            random.shuffle(classes)
+            rng = random.Random(self.seed + self.epoch)  # ← 用独立的 Random 对象
+            rng.shuffle(classes)
+        # if self.shuffle:
+        #     random.shuffle(classes)
 
         for i in range(0, len(classes), self.batch_size):
             selected = classes[i:min(i + self.batch_size, len(classes))]

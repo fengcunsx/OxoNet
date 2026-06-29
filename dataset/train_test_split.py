@@ -114,8 +114,8 @@ if __name__ == '__main__':
     # train, test = split_dataset_esox(file)
     # np.savez_compressed(save_file + '_train.npz', **train)
 
-    data_dir = '/home/bio/8oxog/data/batch4/feature'
-    save_dir = '/home/bio/8oxog/data/batch4/split'
+    data_dir = '/home/bio/8oxog/data/batch1/feature'
+    save_dir = '/home/bio/8oxog/data/batch1/split'
     if os.path.exists(save_dir):
         print('Directory already exists,dataset splitted')
         exit(1)
@@ -138,12 +138,12 @@ if __name__ == '__main__':
     # for file in os.listdir(pos_dir):
     #     file_name = file.split('.')[0] + '.npz'
     #     file_path = os.path.join(pos_dir, file)
-    #     train, test = split_dataset(file_path, args.window_size, args.sig_len)
+    #     train, test = split_dataset_esox(file_path)
     #     np.savez(os.path.join(train_pos_save_path, file_name), **train)
     #     np.savez(os.path.join(test_pos_save_path, file_name), **test)
     #
     #     file_path = os.path.join(neg_dir, file)
-    #     train, test = split_dataset(file_path, args.window_size, args.sig_len)
+    #     train, test = split_dataset_esox(file_path)
     #     np.savez(os.path.join(train_neg_save_path, file_name), **train)
     #     np.savez(os.path.join(test_neg_save_path, file_name), **test)
 

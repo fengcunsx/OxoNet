@@ -11,6 +11,8 @@ from model.loss import FocalLoss
 from model.model import DetectModel
 from pytorch_metric_learning import losses, miners, samplers
 from torch import nn
+import numpy as np
+import random
 
 # 定义颜色常量
 BLUE = '\033[94m'
@@ -68,7 +70,18 @@ def compute_metrics_from_confusion(TP, TN, FP, FN):
     }
 
 
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # 多卡情况
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def train(args: argparse.Namespace):
+    set_seed(args.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "")
     model = DetectModel(sig_blocks=4, sig_l=175, seq_l=5).to(device)
     if args.resume is not None:
@@ -89,10 +102,13 @@ def train(args: argparse.Namespace):
         model.train()
         epoch += args.resume_epoch
         dataset = get_dataset(args.pos_dir, args.neg_dir, args.work_dir, epoch, kmer=5, n_threads=8, generate=True)
+        sampler = MultiSimSampler(len(dataset) // 2, n_sample=args.batch_size, shuffle=True, seed=args.seed)
+        sampler.set_epoch(epoch)
         dataloader = DataLoader(dataset, batch_size=args.batch_size,
-                                sampler=MultiSimSampler(len(dataset) // 2, n_sample=args.batch_size, shuffle=True),
+                                sampler=sampler,
                                 collate_fn=collate_fn, num_workers=args.num_workers)
         TP_total = TN_total = FP_total = FN_total = 0
+        train_loss_total = 0
         pbar = tqdm.tqdm(total=len(dataloader), desc="Train Epoch {}".format(epoch))
         for batch in dataloader:
             optimizer.zero_grad()
@@ -112,6 +128,7 @@ def train(args: argparse.Namespace):
 
             loss.backward()
             optimizer.step()
+            train_loss_total += loss.item()  # ← 加这行
             TP, TN, FP, FN = calculate_confusion(pred.squeeze(-1), label, args.threshold)
             TP_total += TP
             TN_total += TN
@@ -124,20 +141,31 @@ def train(args: argparse.Namespace):
         torch.save(model.state_dict(), os.path.join(args.save_dir, 'model_{}.pth'.format(epoch)))
         metrics = compute_metrics_from_confusion(TP_total, TN_total, FP_total, FN_total)
         pbar.close()
+        train_loss_avg = train_loss_total / len(dataloader)  # ← 取平均
         print(BLUE + 'Train Epoch {} ==> \t'
                      'accuracy: {:.4f}, \t'
                      'precision: {:.4f}, \t'
                      'recall: {:.4f}, \t'
                      'specificity: {:.4f}, \t'
-                     'f1: {:.4f}'.format(
+                     'f1: {:.4f},\t loss{:.4f}'.format(
             epoch,
             metrics['accuracy'],
             metrics['precision'],
             metrics['recall'],
             metrics['specificity'],
-            metrics['f1']
+            metrics['f1'],
+            train_loss_avg
         ))
-        # scheduler.step()
+        train_info = os.path.join(args.save_dir, 'train_info.tsv')
+        with open(train_info, 'a') as f:
+            f.write('\t'.join([str(e) for e in [epoch,
+                                                metrics['accuracy'],
+                                                metrics['precision'],
+                                                metrics['recall'],
+                                                metrics['specificity'],
+                                                metrics['f1'],
+                                                train_loss_avg]]) + '\n')
+            # scheduler.step()
         # test
         model.eval()
         # test_dataset = get_dataset(args.test_pos_dir, args.test_neg_dir, args.test_work_dir, epoch, kmer=5, n_threads=8,
@@ -149,6 +177,7 @@ def train(args: argparse.Namespace):
         pbar = tqdm.tqdm(total=len(test_dataloader), desc="Test Epoch {}".format(epoch))
 
         TP_total = TN_total = FP_total = FN_total = 0
+        test_loss_total = 0
         for batch in test_dataloader:
             signal, kmer, _, _, _, sig_l, label = parse_data(batch, device)
             _, pred = model(signal, kmer, sig_l)
@@ -157,7 +186,7 @@ def train(args: argparse.Namespace):
 
             # 损失
             loss = class_loss(pred.squeeze(-1), label_float)
-
+            test_loss_total += loss.item()  # ← 加这行
             TP, TN, FP, FN = calculate_confusion(pred.squeeze(-1), label, args.threshold)
             TP_total += TP
             TN_total += TN
@@ -166,7 +195,7 @@ def train(args: argparse.Namespace):
 
             pbar.set_postfix({'loss': round(loss.item(), 4)})
             pbar.update(1)
-
+        test_loss_avg = test_loss_total / len(test_dataloader)  # ← 取平均
         metrics = compute_metrics_from_confusion(TP_total, TN_total, FP_total, FN_total)
         pbar.close()
         print(GREEN + 'Test Epoch {} ==> \t'
@@ -174,14 +203,23 @@ def train(args: argparse.Namespace):
                       'precision: {:.4f}, \t'
                       'recall: {:.4f}, \t'
                       'specificity: {:.4f}, \t'
-                      'f1: {:.4f}'.format(
+                      'f1: {:.4f}, \tloss{:.4f}'.format(
             epoch,
             metrics['accuracy'],
             metrics['precision'],
             metrics['recall'],
             metrics['specificity'],
-            metrics['f1']
+            metrics['f1'], test_loss_avg
         ))
+        test_info = os.path.join(args.save_dir, 'test_info.tsv')
+        with open(test_info, 'a') as f:
+            f.write('\t'.join([str(e) for e in [epoch,
+                                                metrics['accuracy'],
+                                                metrics['precision'],
+                                                metrics['recall'],
+                                                metrics['specificity'],
+                                                metrics['f1'],
+                                                test_loss_avg]]) + '\n')
         # scheduler.step(metrics['specificity'])
         if epoch >= 40:
             scheduler.step()
@@ -202,11 +240,26 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--threshold', type=float, default=0.5)
     parser.add_argument('--num-workers', type=int, default=8)
-    parser.add_argument('--save-dir', type=str, default='../model_save_sigBlock4_focalWithMs_deformable_7mer_ab_seq'
+    parser.add_argument('--seed', type=int, default=13)
+    parser.add_argument('--save-dir', type=str, default='../random42_ab_seq'
                         )
     args = parser.parse_args()
 
     train(args)
+
+
+
+
+'''
+Train Epoch 0: 100%|██████████| 6137/6137 [09:21<00:00, 10.93it/s, loss=0.13]
+Train Epoch 0 ==> 	accuracy: 0.6405, 	precision: 0.9959, 	recall: 0.2821, 	specificity: 0.9988, 	f1: 0.4397,	 loss1.1216
+Test Epoch 0: 100%|██████████| 1748/1748 [01:00<00:00, 29.11it/s, loss=0.396]
+Test Epoch 0 ==> 	accuracy: 0.9093, 	precision: 0.9421, 	recall: 0.5705, 	specificity: 0.9915, 	f1: 0.7106, 	loss1.0039
+Train Epoch 1: 100%|██████████| 6137/6137 [10:19<00:00,  9.91it/s, loss=0.1]
+Train Epoch 1 ==> 	accuracy: 0.7542, 	precision: 0.9976, 	recall: 0.5096, 	specificity: 0.9988, 	f1: 0.6746,	 loss0.8735
+Test Epoch 1: 100%|██████████| 1748/1748 [01:08<00:00, 25.57it/s, loss=0.274]
+Test Epoch 1 ==> 	accuracy: 0.9264, 	precision: 0.9595, 	recall: 0.6501, 	specificity: 0.9933, 	f1: 0.7751, 	loss0.8620
+'''
 
 '''
 whole model
@@ -4945,7 +4998,6 @@ Adjusting learning rate of group 0 to 3.8742e-05.
 
 """
 
-
 '''
 7mer 5mer base
 '../model_save_sigBlock4_focalWithMs_deformable_7mer'
@@ -5666,7 +5718,6 @@ Adjusting learning rate of group 0 to 5.8150e-06.
 进程已结束，退出代码为 0
 
 '''
-
 
 '''
 mha ab
@@ -9980,6 +10031,2882 @@ Train Epoch 149: 100%|██████████| 6507/6507 [08:44<00:00, 12
 Train Epoch 149 ==> 	accuracy: 0.8726, 	precision: 0.9997, 	recall: 0.7454, 	specificity: 0.9997, 	f1: 0.8540
 Test Epoch 149: 100%|██████████| 1768/1768 [01:02<00:00, 28.35it/s, loss=1.32]
 Test Epoch 149 ==> 	accuracy: 0.9477, 	precision: 0.9615, 	recall: 0.7755, 	specificity: 0.9920, 	f1: 0.8585
+Adjusting learning rate of group 0 to 5.8150e-06.
+
+进程已结束，退出代码为 0
+
+'''
+
+'''
+42
+/home/bio/anaconda3/bin/python /home/bio/bio_seq/oxog/oxog/script/train.py 
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 0: 100%|██████████| 6137/6137 [10:07<00:00, 10.11it/s, loss=0.147]
+Train Epoch 0 ==> 	accuracy: 0.6423, 	precision: 0.9958, 	recall: 0.2859, 	specificity: 0.9988, 	f1: 0.4442,	 loss1.1119
+Test Epoch 0: 100%|██████████| 1748/1748 [01:10<00:00, 24.76it/s, loss=0.377]
+Test Epoch 0 ==> 	accuracy: 0.9143, 	precision: 0.9446, 	recall: 0.5958, 	specificity: 0.9915, 	f1: 0.7307, 	loss1.0637
+Train Epoch 1: 100%|██████████| 6137/6137 [10:03<00:00, 10.18it/s, loss=0.123]
+Train Epoch 1 ==> 	accuracy: 0.7560, 	precision: 0.9976, 	recall: 0.5132, 	specificity: 0.9987, 	f1: 0.6777,	 loss0.8690
+Test Epoch 1: 100%|██████████| 1748/1748 [01:00<00:00, 28.88it/s, loss=0.292]
+Test Epoch 1 ==> 	accuracy: 0.9336, 	precision: 0.9765, 	recall: 0.6758, 	specificity: 0.9961, 	f1: 0.7988, 	loss0.6567
+Train Epoch 2: 100%|██████████| 6137/6137 [09:19<00:00, 10.97it/s, loss=0.172]
+Train Epoch 2 ==> 	accuracy: 0.7890, 	precision: 0.9981, 	recall: 0.5792, 	specificity: 0.9989, 	f1: 0.7330,	 loss0.7742
+Test Epoch 2: 100%|██████████| 1748/1748 [00:57<00:00, 30.40it/s, loss=0.314]
+Test Epoch 2 ==> 	accuracy: 0.9283, 	precision: 0.9634, 	recall: 0.6573, 	specificity: 0.9940, 	f1: 0.7814, 	loss0.8700
+Train Epoch 3: 100%|██████████| 6137/6137 [09:21<00:00, 10.93it/s, loss=0.186]
+Train Epoch 3 ==> 	accuracy: 0.8008, 	precision: 0.9983, 	recall: 0.6026, 	specificity: 0.9990, 	f1: 0.7516,	 loss0.7547
+Test Epoch 3: 100%|██████████| 1748/1748 [00:56<00:00, 30.92it/s, loss=0.39]
+Test Epoch 3 ==> 	accuracy: 0.9359, 	precision: 0.9670, 	recall: 0.6953, 	specificity: 0.9942, 	f1: 0.8090, 	loss0.8103
+Train Epoch 4: 100%|██████████| 6137/6137 [09:27<00:00, 10.81it/s, loss=0.149]
+Train Epoch 4 ==> 	accuracy: 0.8123, 	precision: 0.9985, 	recall: 0.6256, 	specificity: 0.9991, 	f1: 0.7692,	 loss0.7163
+Test Epoch 4: 100%|██████████| 1748/1748 [00:55<00:00, 31.25it/s, loss=0.056]
+Test Epoch 4 ==> 	accuracy: 0.9368, 	precision: 0.9790, 	recall: 0.6909, 	specificity: 0.9964, 	f1: 0.8101, 	loss0.5784
+Train Epoch 5: 100%|██████████| 6137/6137 [09:18<00:00, 10.99it/s, loss=0.122]
+Train Epoch 5 ==> 	accuracy: 0.8199, 	precision: 0.9987, 	recall: 0.6406, 	specificity: 0.9991, 	f1: 0.7805,	 loss0.7001
+Test Epoch 5: 100%|██████████| 1748/1748 [00:59<00:00, 29.30it/s, loss=0.257]
+Test Epoch 5 ==> 	accuracy: 0.9375, 	precision: 0.9925, 	recall: 0.6849, 	specificity: 0.9988, 	f1: 0.8105, 	loss0.3839
+Train Epoch 6: 100%|██████████| 6137/6137 [08:59<00:00, 11.37it/s, loss=0.129]
+Train Epoch 6 ==> 	accuracy: 0.8261, 	precision: 0.9988, 	recall: 0.6530, 	specificity: 0.9992, 	f1: 0.7897,	 loss0.6800
+Test Epoch 6: 100%|██████████| 1748/1748 [00:57<00:00, 30.54it/s, loss=0.187]
+Test Epoch 6 ==> 	accuracy: 0.9373, 	precision: 0.9832, 	recall: 0.6907, 	specificity: 0.9971, 	f1: 0.8114, 	loss0.5285
+Train Epoch 7: 100%|██████████| 6137/6137 [08:47<00:00, 11.63it/s, loss=0.146]
+Train Epoch 7 ==> 	accuracy: 0.8314, 	precision: 0.9988, 	recall: 0.6636, 	specificity: 0.9992, 	f1: 0.7974,	 loss0.6622
+Test Epoch 7: 100%|██████████| 1748/1748 [00:56<00:00, 30.74it/s, loss=0.281]
+Test Epoch 7 ==> 	accuracy: 0.9403, 	precision: 0.9893, 	recall: 0.7015, 	specificity: 0.9982, 	f1: 0.8209, 	loss0.4241
+Train Epoch 8: 100%|██████████| 6137/6137 [09:03<00:00, 11.29it/s, loss=0.0444]
+Train Epoch 8 ==> 	accuracy: 0.8303, 	precision: 0.9989, 	recall: 0.6613, 	specificity: 0.9993, 	f1: 0.7958,	 loss0.6649
+Test Epoch 8: 100%|██████████| 1748/1748 [00:58<00:00, 29.99it/s, loss=0.267]
+Test Epoch 8 ==> 	accuracy: 0.9421, 	precision: 0.9874, 	recall: 0.7123, 	specificity: 0.9978, 	f1: 0.8276, 	loss0.4774
+Train Epoch 9: 100%|██████████| 6137/6137 [09:01<00:00, 11.32it/s, loss=0.36]
+Train Epoch 9 ==> 	accuracy: 0.8375, 	precision: 0.9990, 	recall: 0.6757, 	specificity: 0.9993, 	f1: 0.8061,	 loss0.6446
+Test Epoch 9: 100%|██████████| 1748/1748 [00:57<00:00, 30.58it/s, loss=0.627]
+Test Epoch 9 ==> 	accuracy: 0.9472, 	precision: 0.9771, 	recall: 0.7470, 	specificity: 0.9958, 	f1: 0.8467, 	loss0.5736
+Train Epoch 10: 100%|██████████| 6137/6137 [08:41<00:00, 11.77it/s, loss=0.0955]
+Train Epoch 10 ==> 	accuracy: 0.8392, 	precision: 0.9990, 	recall: 0.6790, 	specificity: 0.9993, 	f1: 0.8085,	 loss0.6408
+Test Epoch 10: 100%|██████████| 1748/1748 [00:57<00:00, 30.46it/s, loss=0.17]
+Test Epoch 10 ==> 	accuracy: 0.9480, 	precision: 0.9826, 	recall: 0.7469, 	specificity: 0.9968, 	f1: 0.8487, 	loss0.4900
+Train Epoch 11: 100%|██████████| 6137/6137 [09:07<00:00, 11.21it/s, loss=0.11]
+Train Epoch 11 ==> 	accuracy: 0.8444, 	precision: 0.9991, 	recall: 0.6895, 	specificity: 0.9994, 	f1: 0.8159,	 loss0.6270
+Test Epoch 11: 100%|██████████| 1748/1748 [00:59<00:00, 29.62it/s, loss=0.558]
+Test Epoch 11 ==> 	accuracy: 0.9487, 	precision: 0.9831, 	recall: 0.7500, 	specificity: 0.9969, 	f1: 0.8508, 	loss0.5173
+Train Epoch 12: 100%|██████████| 6137/6137 [08:52<00:00, 11.53it/s, loss=0.101]
+Train Epoch 12 ==> 	accuracy: 0.8448, 	precision: 0.9991, 	recall: 0.6902, 	specificity: 0.9994, 	f1: 0.8164,	 loss0.6254
+Test Epoch 12: 100%|██████████| 1748/1748 [00:56<00:00, 31.20it/s, loss=0.388]
+Test Epoch 12 ==> 	accuracy: 0.9462, 	precision: 0.9784, 	recall: 0.7409, 	specificity: 0.9960, 	f1: 0.8432, 	loss0.6035
+Train Epoch 13: 100%|██████████| 6137/6137 [09:20<00:00, 10.96it/s, loss=0.0786]
+Train Epoch 13 ==> 	accuracy: 0.8494, 	precision: 0.9991, 	recall: 0.6994, 	specificity: 0.9994, 	f1: 0.8228,	 loss0.6136
+Test Epoch 13: 100%|██████████| 1748/1748 [00:54<00:00, 32.15it/s, loss=0.246]
+Test Epoch 13 ==> 	accuracy: 0.9442, 	precision: 0.9742, 	recall: 0.7337, 	specificity: 0.9953, 	f1: 0.8370, 	loss0.6943
+Train Epoch 14: 100%|██████████| 6137/6137 [08:38<00:00, 11.85it/s, loss=0.0776]
+Train Epoch 14 ==> 	accuracy: 0.8537, 	precision: 0.9992, 	recall: 0.7081, 	specificity: 0.9994, 	f1: 0.8288,	 loss0.5989
+Test Epoch 14: 100%|██████████| 1748/1748 [00:53<00:00, 32.69it/s, loss=0.463]
+Test Epoch 14 ==> 	accuracy: 0.9441, 	precision: 0.9680, 	recall: 0.7377, 	specificity: 0.9941, 	f1: 0.8373, 	loss0.7771
+Train Epoch 15: 100%|██████████| 6137/6137 [08:28<00:00, 12.06it/s, loss=0.0837]
+Train Epoch 15 ==> 	accuracy: 0.8504, 	precision: 0.9992, 	recall: 0.7014, 	specificity: 0.9995, 	f1: 0.8242,	 loss0.6090
+Test Epoch 15: 100%|██████████| 1748/1748 [00:55<00:00, 31.58it/s, loss=0.103]
+Test Epoch 15 ==> 	accuracy: 0.9429, 	precision: 0.9840, 	recall: 0.7191, 	specificity: 0.9972, 	f1: 0.8309, 	loss0.4855
+Train Epoch 16: 100%|██████████| 6137/6137 [08:36<00:00, 11.87it/s, loss=0.118]
+Train Epoch 16 ==> 	accuracy: 0.8493, 	precision: 0.9993, 	recall: 0.6991, 	specificity: 0.9995, 	f1: 0.8227,	 loss0.6049
+Test Epoch 16: 100%|██████████| 1748/1748 [00:57<00:00, 30.39it/s, loss=1.21]
+Test Epoch 16 ==> 	accuracy: 0.9402, 	precision: 0.9887, 	recall: 0.7016, 	specificity: 0.9981, 	f1: 0.8208, 	loss0.4173
+Train Epoch 17: 100%|██████████| 6137/6137 [08:40<00:00, 11.78it/s, loss=0.135]
+Train Epoch 17 ==> 	accuracy: 0.8538, 	precision: 0.9993, 	recall: 0.7081, 	specificity: 0.9995, 	f1: 0.8289,	 loss0.5984
+Test Epoch 17: 100%|██████████| 1748/1748 [00:53<00:00, 32.65it/s, loss=0.172]
+Test Epoch 17 ==> 	accuracy: 0.9517, 	precision: 0.9798, 	recall: 0.7681, 	specificity: 0.9962, 	f1: 0.8612, 	loss0.5593
+Train Epoch 18: 100%|██████████| 6137/6137 [08:43<00:00, 11.73it/s, loss=0.142]
+Train Epoch 18 ==> 	accuracy: 0.8593, 	precision: 0.9993, 	recall: 0.7191, 	specificity: 0.9995, 	f1: 0.8363,	 loss0.5863
+Test Epoch 18: 100%|██████████| 1748/1748 [00:55<00:00, 31.58it/s, loss=0.782]
+Test Epoch 18 ==> 	accuracy: 0.9510, 	precision: 0.9813, 	recall: 0.7633, 	specificity: 0.9965, 	f1: 0.8587, 	loss0.5643
+Train Epoch 19: 100%|██████████| 6137/6137 [08:42<00:00, 11.73it/s, loss=0.104]
+Train Epoch 19 ==> 	accuracy: 0.8583, 	precision: 0.9993, 	recall: 0.7170, 	specificity: 0.9995, 	f1: 0.8350,	 loss0.5837
+Test Epoch 19: 100%|██████████| 1748/1748 [00:56<00:00, 31.05it/s, loss=0.172]
+Test Epoch 19 ==> 	accuracy: 0.9523, 	precision: 0.9805, 	recall: 0.7707, 	specificity: 0.9963, 	f1: 0.8631, 	loss0.5696
+Train Epoch 20: 100%|██████████| 6137/6137 [08:38<00:00, 11.84it/s, loss=0.0907]
+Train Epoch 20 ==> 	accuracy: 0.8586, 	precision: 0.9993, 	recall: 0.7177, 	specificity: 0.9995, 	f1: 0.8354,	 loss0.5870
+Test Epoch 20: 100%|██████████| 1748/1748 [00:54<00:00, 32.06it/s, loss=0.773]
+Test Epoch 20 ==> 	accuracy: 0.9518, 	precision: 0.9860, 	recall: 0.7636, 	specificity: 0.9974, 	f1: 0.8607, 	loss0.4550
+Train Epoch 21: 100%|██████████| 6137/6137 [08:42<00:00, 11.74it/s, loss=0.068]
+Train Epoch 21 ==> 	accuracy: 0.8625, 	precision: 0.9993, 	recall: 0.7256, 	specificity: 0.9995, 	f1: 0.8407,	 loss0.5742
+Test Epoch 21: 100%|██████████| 1748/1748 [00:55<00:00, 31.76it/s, loss=0.796]
+Test Epoch 21 ==> 	accuracy: 0.9498, 	precision: 0.9866, 	recall: 0.7531, 	specificity: 0.9975, 	f1: 0.8542, 	loss0.4378
+Train Epoch 22: 100%|██████████| 6137/6137 [08:43<00:00, 11.71it/s, loss=0.136]
+Train Epoch 22 ==> 	accuracy: 0.8631, 	precision: 0.9993, 	recall: 0.7266, 	specificity: 0.9995, 	f1: 0.8414,	 loss0.5737
+Test Epoch 22: 100%|██████████| 1748/1748 [00:55<00:00, 31.53it/s, loss=0.21]
+Test Epoch 22 ==> 	accuracy: 0.9524, 	precision: 0.9832, 	recall: 0.7694, 	specificity: 0.9968, 	f1: 0.8632, 	loss0.4580
+Train Epoch 23: 100%|██████████| 6137/6137 [08:25<00:00, 12.15it/s, loss=0.103]
+Train Epoch 23 ==> 	accuracy: 0.8649, 	precision: 0.9994, 	recall: 0.7303, 	specificity: 0.9995, 	f1: 0.8439,	 loss0.5673
+Test Epoch 23: 100%|██████████| 1748/1748 [00:56<00:00, 30.82it/s, loss=0.166]
+Test Epoch 23 ==> 	accuracy: 0.9539, 	precision: 0.9740, 	recall: 0.7846, 	specificity: 0.9949, 	f1: 0.8691, 	loss0.7699
+Train Epoch 24: 100%|██████████| 6137/6137 [08:39<00:00, 11.81it/s, loss=0.162]
+Train Epoch 24 ==> 	accuracy: 0.8653, 	precision: 0.9993, 	recall: 0.7310, 	specificity: 0.9995, 	f1: 0.8444,	 loss0.5653
+Test Epoch 24: 100%|██████████| 1748/1748 [00:54<00:00, 31.90it/s, loss=0.18]
+Test Epoch 24 ==> 	accuracy: 0.9530, 	precision: 0.9742, 	recall: 0.7797, 	specificity: 0.9950, 	f1: 0.8662, 	loss0.7234
+Train Epoch 25: 100%|██████████| 6137/6137 [08:37<00:00, 11.87it/s, loss=0.0951]
+Train Epoch 25 ==> 	accuracy: 0.8697, 	precision: 0.9994, 	recall: 0.7398, 	specificity: 0.9995, 	f1: 0.8502,	 loss0.5556
+Test Epoch 25: 100%|██████████| 1748/1748 [00:53<00:00, 32.83it/s, loss=0.548]
+Test Epoch 25 ==> 	accuracy: 0.9526, 	precision: 0.9727, 	recall: 0.7790, 	specificity: 0.9947, 	f1: 0.8651, 	loss0.6879
+Train Epoch 26: 100%|██████████| 6137/6137 [08:36<00:00, 11.87it/s, loss=0.0213]
+Train Epoch 26 ==> 	accuracy: 0.8679, 	precision: 0.9994, 	recall: 0.7362, 	specificity: 0.9996, 	f1: 0.8478,	 loss0.5593
+Test Epoch 26: 100%|██████████| 1748/1748 [00:56<00:00, 30.90it/s, loss=0.239]
+Test Epoch 26 ==> 	accuracy: 0.9523, 	precision: 0.9832, 	recall: 0.7688, 	specificity: 0.9968, 	f1: 0.8629, 	loss0.4966
+Train Epoch 27: 100%|██████████| 6137/6137 [08:38<00:00, 11.83it/s, loss=0.103]
+Train Epoch 27 ==> 	accuracy: 0.8703, 	precision: 0.9994, 	recall: 0.7410, 	specificity: 0.9996, 	f1: 0.8510,	 loss0.5496
+Test Epoch 27: 100%|██████████| 1748/1748 [00:50<00:00, 34.37it/s, loss=0.27]
+Test Epoch 27 ==> 	accuracy: 0.9531, 	precision: 0.9755, 	recall: 0.7790, 	specificity: 0.9953, 	f1: 0.8662, 	loss0.6701
+Train Epoch 28: 100%|██████████| 6137/6137 [08:56<00:00, 11.44it/s, loss=0.0718]
+Train Epoch 28 ==> 	accuracy: 0.8686, 	precision: 0.9994, 	recall: 0.7376, 	specificity: 0.9995, 	f1: 0.8488,	 loss0.5586
+Test Epoch 28: 100%|██████████| 1748/1748 [00:54<00:00, 31.89it/s, loss=0.118]
+Test Epoch 28 ==> 	accuracy: 0.9533, 	precision: 0.9751, 	recall: 0.7805, 	specificity: 0.9952, 	f1: 0.8670, 	loss0.6099
+Train Epoch 29: 100%|██████████| 6137/6137 [08:37<00:00, 11.87it/s, loss=0.011]
+Train Epoch 29 ==> 	accuracy: 0.8741, 	precision: 0.9994, 	recall: 0.7487, 	specificity: 0.9995, 	f1: 0.8561,	 loss0.5384
+Test Epoch 29: 100%|██████████| 1748/1748 [00:54<00:00, 32.32it/s, loss=0.17]
+Test Epoch 29 ==> 	accuracy: 0.9538, 	precision: 0.9768, 	recall: 0.7821, 	specificity: 0.9955, 	f1: 0.8686, 	loss0.7110
+Train Epoch 30: 100%|██████████| 6137/6137 [08:41<00:00, 11.77it/s, loss=0.0709]
+Train Epoch 30 ==> 	accuracy: 0.8711, 	precision: 0.9994, 	recall: 0.7426, 	specificity: 0.9996, 	f1: 0.8520,	 loss0.5599
+Test Epoch 30: 100%|██████████| 1748/1748 [00:55<00:00, 31.42it/s, loss=0.13]
+Test Epoch 30 ==> 	accuracy: 0.9523, 	precision: 0.9799, 	recall: 0.7712, 	specificity: 0.9962, 	f1: 0.8631, 	loss0.5927
+Train Epoch 31: 100%|██████████| 6137/6137 [08:40<00:00, 11.79it/s, loss=0.0835]
+Train Epoch 31 ==> 	accuracy: 0.8768, 	precision: 0.9995, 	recall: 0.7540, 	specificity: 0.9996, 	f1: 0.8595,	 loss0.5273
+Test Epoch 31: 100%|██████████| 1748/1748 [00:52<00:00, 33.13it/s, loss=0.186]
+Test Epoch 31 ==> 	accuracy: 0.9549, 	precision: 0.9759, 	recall: 0.7885, 	specificity: 0.9953, 	f1: 0.8723, 	loss0.6403
+Train Epoch 32: 100%|██████████| 6137/6137 [08:31<00:00, 12.00it/s, loss=0.0926]
+Train Epoch 32 ==> 	accuracy: 0.8717, 	precision: 0.9995, 	recall: 0.7437, 	specificity: 0.9996, 	f1: 0.8528,	 loss0.5524
+Test Epoch 32: 100%|██████████| 1748/1748 [00:52<00:00, 33.61it/s, loss=0.107]
+Test Epoch 32 ==> 	accuracy: 0.9556, 	precision: 0.9835, 	recall: 0.7856, 	specificity: 0.9968, 	f1: 0.8734, 	loss0.5177
+Train Epoch 33: 100%|██████████| 6137/6137 [08:22<00:00, 12.22it/s, loss=0.104]
+Train Epoch 33 ==> 	accuracy: 0.8733, 	precision: 0.9995, 	recall: 0.7470, 	specificity: 0.9996, 	f1: 0.8550,	 loss0.5335
+Test Epoch 33: 100%|██████████| 1748/1748 [00:55<00:00, 31.67it/s, loss=2.02]
+Test Epoch 33 ==> 	accuracy: 0.9575, 	precision: 0.9853, 	recall: 0.7939, 	specificity: 0.9971, 	f1: 0.8793, 	loss0.4843
+Train Epoch 34: 100%|██████████| 6137/6137 [08:28<00:00, 12.08it/s, loss=0.067]
+Train Epoch 34 ==> 	accuracy: 0.8746, 	precision: 0.9995, 	recall: 0.7496, 	specificity: 0.9996, 	f1: 0.8567,	 loss0.5474
+Test Epoch 34: 100%|██████████| 1748/1748 [00:54<00:00, 32.19it/s, loss=0.177]
+Test Epoch 34 ==> 	accuracy: 0.9569, 	precision: 0.9806, 	recall: 0.7950, 	specificity: 0.9962, 	f1: 0.8781, 	loss0.6664
+Train Epoch 35: 100%|██████████| 6137/6137 [08:29<00:00, 12.04it/s, loss=0.0949]
+Train Epoch 35 ==> 	accuracy: 0.8768, 	precision: 0.9995, 	recall: 0.7539, 	specificity: 0.9996, 	f1: 0.8595,	 loss0.5275
+Test Epoch 35: 100%|██████████| 1748/1748 [00:55<00:00, 31.71it/s, loss=0.227]
+Test Epoch 35 ==> 	accuracy: 0.9547, 	precision: 0.9848, 	recall: 0.7799, 	specificity: 0.9971, 	f1: 0.8704, 	loss0.5217
+Train Epoch 36: 100%|██████████| 6137/6137 [08:40<00:00, 11.78it/s, loss=0.0935]
+Train Epoch 36 ==> 	accuracy: 0.8779, 	precision: 0.9994, 	recall: 0.7563, 	specificity: 0.9996, 	f1: 0.8610,	 loss0.5357
+Test Epoch 36: 100%|██████████| 1748/1748 [00:52<00:00, 33.29it/s, loss=0.418]
+Test Epoch 36 ==> 	accuracy: 0.9533, 	precision: 0.9858, 	recall: 0.7715, 	specificity: 0.9973, 	f1: 0.8656, 	loss0.4638
+Train Epoch 37: 100%|██████████| 6137/6137 [08:42<00:00, 11.75it/s, loss=0.136]
+Train Epoch 37 ==> 	accuracy: 0.8782, 	precision: 0.9995, 	recall: 0.7569, 	specificity: 0.9996, 	f1: 0.8614,	 loss0.5316
+Test Epoch 37: 100%|██████████| 1748/1748 [00:55<00:00, 31.62it/s, loss=0.127]
+Test Epoch 37 ==> 	accuracy: 0.9557, 	precision: 0.9789, 	recall: 0.7898, 	specificity: 0.9959, 	f1: 0.8742, 	loss0.6097
+Train Epoch 38: 100%|██████████| 6137/6137 [08:34<00:00, 11.93it/s, loss=0.0637]
+Train Epoch 38 ==> 	accuracy: 0.8763, 	precision: 0.9995, 	recall: 0.7530, 	specificity: 0.9996, 	f1: 0.8589,	 loss0.5333
+Test Epoch 38: 100%|██████████| 1748/1748 [00:52<00:00, 33.08it/s, loss=0.292]
+Test Epoch 38 ==> 	accuracy: 0.9599, 	precision: 0.9802, 	recall: 0.8109, 	specificity: 0.9960, 	f1: 0.8876, 	loss0.5233
+Train Epoch 39: 100%|██████████| 6137/6137 [08:34<00:00, 11.92it/s, loss=0.132]
+Train Epoch 39 ==> 	accuracy: 0.8800, 	precision: 0.9995, 	recall: 0.7604, 	specificity: 0.9996, 	f1: 0.8637,	 loss0.5205
+Test Epoch 39: 100%|██████████| 1748/1748 [00:56<00:00, 30.94it/s, loss=0.474]
+Test Epoch 39 ==> 	accuracy: 0.9534, 	precision: 0.9882, 	recall: 0.7703, 	specificity: 0.9978, 	f1: 0.8658, 	loss0.4617
+Train Epoch 40: 100%|██████████| 6137/6137 [08:32<00:00, 11.98it/s, loss=0.0466]
+Train Epoch 40 ==> 	accuracy: 0.8787, 	precision: 0.9995, 	recall: 0.7577, 	specificity: 0.9996, 	f1: 0.8620,	 loss0.3074
+Test Epoch 40: 100%|██████████| 1748/1748 [00:56<00:00, 31.17it/s, loss=0.131]
+Test Epoch 40 ==> 	accuracy: 0.9545, 	precision: 0.9775, 	recall: 0.7847, 	specificity: 0.9956, 	f1: 0.8705, 	loss0.6564
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 41: 100%|██████████| 6137/6137 [08:12<00:00, 12.47it/s, loss=0.0144]
+Train Epoch 41 ==> 	accuracy: 0.8796, 	precision: 0.9995, 	recall: 0.7596, 	specificity: 0.9996, 	f1: 0.8632,	 loss0.3137
+Test Epoch 41: 100%|██████████| 1748/1748 [00:53<00:00, 32.84it/s, loss=0.0633]
+Test Epoch 41 ==> 	accuracy: 0.9567, 	precision: 0.9843, 	recall: 0.7909, 	specificity: 0.9969, 	f1: 0.8771, 	loss0.4628
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 42: 100%|██████████| 6137/6137 [08:17<00:00, 12.33it/s, loss=0.323]
+Train Epoch 42 ==> 	accuracy: 0.8815, 	precision: 0.9995, 	recall: 0.7634, 	specificity: 0.9996, 	f1: 0.8656,	 loss0.3033
+Test Epoch 42: 100%|██████████| 1748/1748 [00:50<00:00, 34.50it/s, loss=0.139]
+Test Epoch 42 ==> 	accuracy: 0.9587, 	precision: 0.9802, 	recall: 0.8048, 	specificity: 0.9961, 	f1: 0.8839, 	loss0.5834
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 43: 100%|██████████| 6137/6137 [08:16<00:00, 12.37it/s, loss=0.0381]
+Train Epoch 43 ==> 	accuracy: 0.8815, 	precision: 0.9995, 	recall: 0.7634, 	specificity: 0.9996, 	f1: 0.8657,	 loss0.3010
+Test Epoch 43: 100%|██████████| 1748/1748 [00:54<00:00, 32.10it/s, loss=0.0634]
+Test Epoch 43 ==> 	accuracy: 0.9574, 	precision: 0.9840, 	recall: 0.7947, 	specificity: 0.9969, 	f1: 0.8793, 	loss0.5352
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 44: 100%|██████████| 6137/6137 [08:20<00:00, 12.26it/s, loss=0.0222]
+Train Epoch 44 ==> 	accuracy: 0.8853, 	precision: 0.9995, 	recall: 0.7710, 	specificity: 0.9996, 	f1: 0.8705,	 loss0.2942
+Test Epoch 44: 100%|██████████| 1748/1748 [00:55<00:00, 31.41it/s, loss=0.595]
+Test Epoch 44 ==> 	accuracy: 0.9582, 	precision: 0.9775, 	recall: 0.8042, 	specificity: 0.9955, 	f1: 0.8824, 	loss0.6680
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 45: 100%|██████████| 6137/6137 [08:17<00:00, 12.34it/s, loss=0.0103]
+Train Epoch 45 ==> 	accuracy: 0.8836, 	precision: 0.9996, 	recall: 0.7675, 	specificity: 0.9997, 	f1: 0.8683,	 loss0.3021
+Test Epoch 45: 100%|██████████| 1748/1748 [00:54<00:00, 32.14it/s, loss=0.105]
+Test Epoch 45 ==> 	accuracy: 0.9581, 	precision: 0.9842, 	recall: 0.7978, 	specificity: 0.9969, 	f1: 0.8813, 	loss0.5960
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 46: 100%|██████████| 6137/6137 [08:23<00:00, 12.20it/s, loss=0.0109]
+Train Epoch 46 ==> 	accuracy: 0.8860, 	precision: 0.9995, 	recall: 0.7724, 	specificity: 0.9996, 	f1: 0.8714,	 loss0.2883
+Test Epoch 46: 100%|██████████| 1748/1748 [00:57<00:00, 30.24it/s, loss=0.309]
+Test Epoch 46 ==> 	accuracy: 0.9596, 	precision: 0.9727, 	recall: 0.8161, 	specificity: 0.9944, 	f1: 0.8875, 	loss0.8086
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 47: 100%|██████████| 6137/6137 [08:15<00:00, 12.38it/s, loss=0.0078]
+Train Epoch 47 ==> 	accuracy: 0.8833, 	precision: 0.9995, 	recall: 0.7670, 	specificity: 0.9996, 	f1: 0.8680,	 loss0.2990
+Test Epoch 47: 100%|██████████| 1748/1748 [00:56<00:00, 30.86it/s, loss=0.324]
+Test Epoch 47 ==> 	accuracy: 0.9573, 	precision: 0.9901, 	recall: 0.7893, 	specificity: 0.9981, 	f1: 0.8784, 	loss0.4382
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 48: 100%|██████████| 6137/6137 [08:32<00:00, 11.96it/s, loss=0.0376]
+Train Epoch 48 ==> 	accuracy: 0.8894, 	precision: 0.9996, 	recall: 0.7791, 	specificity: 0.9997, 	f1: 0.8756,	 loss0.2853
+Test Epoch 48: 100%|██████████| 1748/1748 [00:57<00:00, 30.45it/s, loss=0.0611]
+Test Epoch 48 ==> 	accuracy: 0.9568, 	precision: 0.9906, 	recall: 0.7863, 	specificity: 0.9982, 	f1: 0.8767, 	loss0.4067
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 49: 100%|██████████| 6137/6137 [08:26<00:00, 12.13it/s, loss=0.0152]
+Train Epoch 49 ==> 	accuracy: 0.8861, 	precision: 0.9996, 	recall: 0.7726, 	specificity: 0.9997, 	f1: 0.8716,	 loss0.2982
+Test Epoch 49: 100%|██████████| 1748/1748 [00:55<00:00, 31.32it/s, loss=0.146]
+Test Epoch 49 ==> 	accuracy: 0.9602, 	precision: 0.9891, 	recall: 0.8047, 	specificity: 0.9979, 	f1: 0.8874, 	loss0.4261
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 50: 100%|██████████| 6137/6137 [08:31<00:00, 12.00it/s, loss=0.0176]
+Train Epoch 50 ==> 	accuracy: 0.8927, 	precision: 0.9995, 	recall: 0.7857, 	specificity: 0.9996, 	f1: 0.8798,	 loss0.2754
+Test Epoch 50: 100%|██████████| 1748/1748 [00:54<00:00, 32.17it/s, loss=0.97]
+Test Epoch 50 ==> 	accuracy: 0.9599, 	precision: 0.9878, 	recall: 0.8045, 	specificity: 0.9976, 	f1: 0.8867, 	loss0.4318
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 51: 100%|██████████| 6137/6137 [08:25<00:00, 12.14it/s, loss=0.012]
+Train Epoch 51 ==> 	accuracy: 0.8893, 	precision: 0.9996, 	recall: 0.7790, 	specificity: 0.9997, 	f1: 0.8756,	 loss0.2917
+Test Epoch 51: 100%|██████████| 1748/1748 [00:55<00:00, 31.42it/s, loss=0.0529]
+Test Epoch 51 ==> 	accuracy: 0.9611, 	precision: 0.9900, 	recall: 0.8088, 	specificity: 0.9980, 	f1: 0.8903, 	loss0.4380
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 52: 100%|██████████| 6137/6137 [08:26<00:00, 12.11it/s, loss=0.0017]
+Train Epoch 52 ==> 	accuracy: 0.8938, 	precision: 0.9996, 	recall: 0.7880, 	specificity: 0.9997, 	f1: 0.8813,	 loss0.2747
+Test Epoch 52: 100%|██████████| 1748/1748 [00:56<00:00, 30.68it/s, loss=0.0756]
+Test Epoch 52 ==> 	accuracy: 0.9625, 	precision: 0.9857, 	recall: 0.8198, 	specificity: 0.9971, 	f1: 0.8952, 	loss0.4843
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 53: 100%|██████████| 6137/6137 [08:19<00:00, 12.29it/s, loss=0.0305]
+Train Epoch 53 ==> 	accuracy: 0.8928, 	precision: 0.9996, 	recall: 0.7860, 	specificity: 0.9997, 	f1: 0.8800,	 loss0.2824
+Test Epoch 53: 100%|██████████| 1748/1748 [00:55<00:00, 31.37it/s, loss=0.107]
+Test Epoch 53 ==> 	accuracy: 0.9623, 	precision: 0.9854, 	recall: 0.8191, 	specificity: 0.9971, 	f1: 0.8946, 	loss0.4947
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 54: 100%|██████████| 6137/6137 [08:25<00:00, 12.15it/s, loss=0.0012]
+Train Epoch 54 ==> 	accuracy: 0.8944, 	precision: 0.9996, 	recall: 0.7890, 	specificity: 0.9997, 	f1: 0.8819,	 loss0.2739
+Test Epoch 54: 100%|██████████| 1748/1748 [00:56<00:00, 30.79it/s, loss=0.0761]
+Test Epoch 54 ==> 	accuracy: 0.9574, 	precision: 0.9878, 	recall: 0.7917, 	specificity: 0.9976, 	f1: 0.8790, 	loss0.5197
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 55: 100%|██████████| 6137/6137 [08:24<00:00, 12.16it/s, loss=0.0066]
+Train Epoch 55 ==> 	accuracy: 0.8956, 	precision: 0.9996, 	recall: 0.7915, 	specificity: 0.9997, 	f1: 0.8835,	 loss0.2730
+Test Epoch 55: 100%|██████████| 1748/1748 [00:59<00:00, 29.23it/s, loss=0.252]
+Test Epoch 55 ==> 	accuracy: 0.9635, 	precision: 0.9830, 	recall: 0.8272, 	specificity: 0.9965, 	f1: 0.8984, 	loss0.6967
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 56: 100%|██████████| 6137/6137 [08:15<00:00, 12.38it/s, loss=0.0303]
+Train Epoch 56 ==> 	accuracy: 0.8967, 	precision: 0.9996, 	recall: 0.7938, 	specificity: 0.9997, 	f1: 0.8849,	 loss0.2738
+Test Epoch 56: 100%|██████████| 1748/1748 [00:56<00:00, 30.96it/s, loss=0.522]
+Test Epoch 56 ==> 	accuracy: 0.9626, 	precision: 0.9821, 	recall: 0.8232, 	specificity: 0.9964, 	f1: 0.8956, 	loss0.6454
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 57: 100%|██████████| 6137/6137 [08:28<00:00, 12.07it/s, loss=0.0675]
+Train Epoch 57 ==> 	accuracy: 0.8983, 	precision: 0.9996, 	recall: 0.7969, 	specificity: 0.9997, 	f1: 0.8868,	 loss0.2639
+Test Epoch 57: 100%|██████████| 1748/1748 [00:53<00:00, 32.63it/s, loss=0.0522]
+Test Epoch 57 ==> 	accuracy: 0.9639, 	precision: 0.9816, 	recall: 0.8305, 	specificity: 0.9962, 	f1: 0.8998, 	loss0.7776
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 58: 100%|██████████| 6137/6137 [08:20<00:00, 12.27it/s, loss=0.0132]
+Train Epoch 58 ==> 	accuracy: 0.8959, 	precision: 0.9996, 	recall: 0.7920, 	specificity: 0.9997, 	f1: 0.8838,	 loss0.2738
+Test Epoch 58: 100%|██████████| 1748/1748 [00:56<00:00, 31.02it/s, loss=3.09]
+Test Epoch 58 ==> 	accuracy: 0.9613, 	precision: 0.9800, 	recall: 0.8181, 	specificity: 0.9960, 	f1: 0.8918, 	loss0.6862
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 59: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.0103]
+Train Epoch 59 ==> 	accuracy: 0.8980, 	precision: 0.9996, 	recall: 0.7964, 	specificity: 0.9997, 	f1: 0.8865,	 loss0.2674
+Test Epoch 59: 100%|██████████| 1748/1748 [00:52<00:00, 33.01it/s, loss=0.404]
+Test Epoch 59 ==> 	accuracy: 0.9640, 	precision: 0.9810, 	recall: 0.8317, 	specificity: 0.9961, 	f1: 0.9002, 	loss0.6019
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 60: 100%|██████████| 6137/6137 [08:18<00:00, 12.30it/s, loss=0.0663]
+Train Epoch 60 ==> 	accuracy: 0.9012, 	precision: 0.9996, 	recall: 0.8026, 	specificity: 0.9997, 	f1: 0.8904,	 loss0.2634
+Test Epoch 60: 100%|██████████| 1748/1748 [00:52<00:00, 33.17it/s, loss=1.58]
+Test Epoch 60 ==> 	accuracy: 0.9637, 	precision: 0.9780, 	recall: 0.8327, 	specificity: 0.9955, 	f1: 0.8995, 	loss0.7327
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 61: 100%|██████████| 6137/6137 [08:13<00:00, 12.43it/s, loss=0.0324]
+Train Epoch 61 ==> 	accuracy: 0.9022, 	precision: 0.9997, 	recall: 0.8047, 	specificity: 0.9997, 	f1: 0.8916,	 loss0.2584
+Test Epoch 61: 100%|██████████| 1748/1748 [00:55<00:00, 31.39it/s, loss=0.116]
+Test Epoch 61 ==> 	accuracy: 0.9629, 	precision: 0.9749, 	recall: 0.8313, 	specificity: 0.9948, 	f1: 0.8974, 	loss0.8846
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 62: 100%|██████████| 6137/6137 [08:34<00:00, 11.93it/s, loss=0.0127]
+Train Epoch 62 ==> 	accuracy: 0.9006, 	precision: 0.9996, 	recall: 0.8015, 	specificity: 0.9997, 	f1: 0.8897,	 loss0.2608
+Test Epoch 62: 100%|██████████| 1748/1748 [00:53<00:00, 32.65it/s, loss=0.186]
+Test Epoch 62 ==> 	accuracy: 0.9634, 	precision: 0.9841, 	recall: 0.8258, 	specificity: 0.9968, 	f1: 0.8980, 	loss0.6744
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 63: 100%|██████████| 6137/6137 [08:40<00:00, 11.79it/s, loss=0.0148]
+Train Epoch 63 ==> 	accuracy: 0.9031, 	precision: 0.9996, 	recall: 0.8066, 	specificity: 0.9997, 	f1: 0.8928,	 loss0.2582
+Test Epoch 63: 100%|██████████| 1748/1748 [00:59<00:00, 29.18it/s, loss=0.0354]
+Test Epoch 63 ==> 	accuracy: 0.9643, 	precision: 0.9722, 	recall: 0.8409, 	specificity: 0.9942, 	f1: 0.9018, 	loss0.7176
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 64: 100%|██████████| 6137/6137 [08:31<00:00, 12.00it/s, loss=0.0195]
+Train Epoch 64 ==> 	accuracy: 0.9041, 	precision: 0.9997, 	recall: 0.8084, 	specificity: 0.9997, 	f1: 0.8939,	 loss0.2583
+Test Epoch 64: 100%|██████████| 1748/1748 [00:55<00:00, 31.49it/s, loss=0.117]
+Test Epoch 64 ==> 	accuracy: 0.9659, 	precision: 0.9791, 	recall: 0.8430, 	specificity: 0.9956, 	f1: 0.9060, 	loss0.7944
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 65: 100%|██████████| 6137/6137 [08:30<00:00, 12.02it/s, loss=0.0023]
+Train Epoch 65 ==> 	accuracy: 0.9054, 	precision: 0.9997, 	recall: 0.8111, 	specificity: 0.9997, 	f1: 0.8956,	 loss0.2507
+Test Epoch 65: 100%|██████████| 1748/1748 [00:55<00:00, 31.77it/s, loss=0.0644]
+Test Epoch 65 ==> 	accuracy: 0.9654, 	precision: 0.9808, 	recall: 0.8392, 	specificity: 0.9960, 	f1: 0.9045, 	loss0.8486
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 66: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.0197]
+Train Epoch 66 ==> 	accuracy: 0.9026, 	precision: 0.9997, 	recall: 0.8055, 	specificity: 0.9997, 	f1: 0.8921,	 loss0.2579
+Test Epoch 66: 100%|██████████| 1748/1748 [00:53<00:00, 32.45it/s, loss=1.39]
+Test Epoch 66 ==> 	accuracy: 0.9604, 	precision: 0.9849, 	recall: 0.8092, 	specificity: 0.9970, 	f1: 0.8885, 	loss0.5372
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 67: 100%|██████████| 6137/6137 [08:13<00:00, 12.45it/s, loss=0.0538]
+Train Epoch 67 ==> 	accuracy: 0.9046, 	precision: 0.9997, 	recall: 0.8096, 	specificity: 0.9997, 	f1: 0.8946,	 loss0.2524
+Test Epoch 67: 100%|██████████| 1748/1748 [00:54<00:00, 31.92it/s, loss=0.0482]
+Test Epoch 67 ==> 	accuracy: 0.9644, 	precision: 0.9810, 	recall: 0.8337, 	specificity: 0.9961, 	f1: 0.9013, 	loss0.7944
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 68: 100%|██████████| 6137/6137 [08:16<00:00, 12.35it/s, loss=0.0189]
+Train Epoch 68 ==> 	accuracy: 0.9077, 	precision: 0.9997, 	recall: 0.8157, 	specificity: 0.9997, 	f1: 0.8984,	 loss0.2465
+Test Epoch 68: 100%|██████████| 1748/1748 [00:53<00:00, 32.64it/s, loss=0.221]
+Test Epoch 68 ==> 	accuracy: 0.9667, 	precision: 0.9796, 	recall: 0.8469, 	specificity: 0.9957, 	f1: 0.9084, 	loss0.7778
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 69: 100%|██████████| 6137/6137 [08:17<00:00, 12.33it/s, loss=0.0201]
+Train Epoch 69 ==> 	accuracy: 0.9075, 	precision: 0.9997, 	recall: 0.8153, 	specificity: 0.9998, 	f1: 0.8982,	 loss0.2475
+Test Epoch 69: 100%|██████████| 1748/1748 [00:54<00:00, 32.25it/s, loss=0.175]
+Test Epoch 69 ==> 	accuracy: 0.9641, 	precision: 0.9833, 	recall: 0.8300, 	specificity: 0.9966, 	f1: 0.9002, 	loss0.7080
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 70: 100%|██████████| 6137/6137 [08:12<00:00, 12.46it/s, loss=0.0312]
+Train Epoch 70 ==> 	accuracy: 0.9067, 	precision: 0.9997, 	recall: 0.8136, 	specificity: 0.9997, 	f1: 0.8971,	 loss0.2476
+Test Epoch 70: 100%|██████████| 1748/1748 [00:51<00:00, 33.97it/s, loss=0.176]
+Test Epoch 70 ==> 	accuracy: 0.9659, 	precision: 0.9827, 	recall: 0.8400, 	specificity: 0.9964, 	f1: 0.9058, 	loss0.6339
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 71: 100%|██████████| 6137/6137 [08:11<00:00, 12.50it/s, loss=0.0178]
+Train Epoch 71 ==> 	accuracy: 0.9073, 	precision: 0.9997, 	recall: 0.8148, 	specificity: 0.9998, 	f1: 0.8978,	 loss0.2504
+Test Epoch 71: 100%|██████████| 1748/1748 [00:50<00:00, 34.61it/s, loss=0.231]
+Test Epoch 71 ==> 	accuracy: 0.9658, 	precision: 0.9805, 	recall: 0.8413, 	specificity: 0.9959, 	f1: 0.9056, 	loss0.7479
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 72: 100%|██████████| 6137/6137 [07:56<00:00, 12.88it/s, loss=0.24]
+Train Epoch 72 ==> 	accuracy: 0.9108, 	precision: 0.9997, 	recall: 0.8219, 	specificity: 0.9997, 	f1: 0.9021,	 loss0.2390
+Test Epoch 72: 100%|██████████| 1748/1748 [00:51<00:00, 34.12it/s, loss=0.0315]
+Test Epoch 72 ==> 	accuracy: 0.9674, 	precision: 0.9843, 	recall: 0.8463, 	specificity: 0.9967, 	f1: 0.9101, 	loss0.6209
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 73: 100%|██████████| 6137/6137 [08:02<00:00, 12.73it/s, loss=0.0097]
+Train Epoch 73 ==> 	accuracy: 0.9101, 	precision: 0.9997, 	recall: 0.8205, 	specificity: 0.9997, 	f1: 0.9013,	 loss0.2441
+Test Epoch 73: 100%|██████████| 1748/1748 [00:49<00:00, 35.24it/s, loss=0.0761]
+Test Epoch 73 ==> 	accuracy: 0.9670, 	precision: 0.9792, 	recall: 0.8488, 	specificity: 0.9956, 	f1: 0.9094, 	loss0.7478
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 74: 100%|██████████| 6137/6137 [08:03<00:00, 12.70it/s, loss=0.0139]
+Train Epoch 74 ==> 	accuracy: 0.9116, 	precision: 0.9997, 	recall: 0.8235, 	specificity: 0.9997, 	f1: 0.9031,	 loss0.2356
+Test Epoch 74: 100%|██████████| 1748/1748 [00:56<00:00, 30.93it/s, loss=0.0864]
+Test Epoch 74 ==> 	accuracy: 0.9677, 	precision: 0.9825, 	recall: 0.8494, 	specificity: 0.9963, 	f1: 0.9111, 	loss0.5842
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 75: 100%|██████████| 6137/6137 [08:09<00:00, 12.55it/s, loss=0.0172]
+Train Epoch 75 ==> 	accuracy: 0.9104, 	precision: 0.9997, 	recall: 0.8211, 	specificity: 0.9997, 	f1: 0.9016,	 loss0.2437
+Test Epoch 75: 100%|██████████| 1748/1748 [00:51<00:00, 34.06it/s, loss=0.587]
+Test Epoch 75 ==> 	accuracy: 0.9668, 	precision: 0.9807, 	recall: 0.8463, 	specificity: 0.9960, 	f1: 0.9086, 	loss0.7248
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 76: 100%|██████████| 6137/6137 [08:06<00:00, 12.61it/s, loss=0.011]
+Train Epoch 76 ==> 	accuracy: 0.9111, 	precision: 0.9997, 	recall: 0.8224, 	specificity: 0.9997, 	f1: 0.9024,	 loss0.2344
+Test Epoch 76: 100%|██████████| 1748/1748 [00:53<00:00, 32.39it/s, loss=0.153]
+Test Epoch 76 ==> 	accuracy: 0.9668, 	precision: 0.9803, 	recall: 0.8469, 	specificity: 0.9959, 	f1: 0.9088, 	loss0.6829
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 77: 100%|██████████| 6137/6137 [08:20<00:00, 12.27it/s, loss=0.0072]
+Train Epoch 77 ==> 	accuracy: 0.9117, 	precision: 0.9997, 	recall: 0.8236, 	specificity: 0.9997, 	f1: 0.9031,	 loss0.2369
+Test Epoch 77: 100%|██████████| 1748/1748 [00:54<00:00, 32.17it/s, loss=0.641]
+Test Epoch 77 ==> 	accuracy: 0.9666, 	precision: 0.9785, 	recall: 0.8473, 	specificity: 0.9955, 	f1: 0.9082, 	loss0.6967
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 78: 100%|██████████| 6137/6137 [08:09<00:00, 12.54it/s, loss=0.0032]
+Train Epoch 78 ==> 	accuracy: 0.9140, 	precision: 0.9997, 	recall: 0.8282, 	specificity: 0.9998, 	f1: 0.9059,	 loss0.2349
+Test Epoch 78: 100%|██████████| 1748/1748 [00:53<00:00, 32.78it/s, loss=1.76]
+Test Epoch 78 ==> 	accuracy: 0.9663, 	precision: 0.9818, 	recall: 0.8427, 	specificity: 0.9962, 	f1: 0.9069, 	loss0.6672
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 79: 100%|██████████| 6137/6137 [08:13<00:00, 12.42it/s, loss=0.0045]
+Train Epoch 79 ==> 	accuracy: 0.9134, 	precision: 0.9997, 	recall: 0.8270, 	specificity: 0.9998, 	f1: 0.9052,	 loss0.2327
+Test Epoch 79: 100%|██████████| 1748/1748 [00:54<00:00, 32.15it/s, loss=0.244]
+Test Epoch 79 ==> 	accuracy: 0.9665, 	precision: 0.9703, 	recall: 0.8547, 	specificity: 0.9937, 	f1: 0.9088, 	loss0.9141
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 80: 100%|██████████| 6137/6137 [08:07<00:00, 12.59it/s, loss=0.0106]
+Train Epoch 80 ==> 	accuracy: 0.9133, 	precision: 0.9997, 	recall: 0.8269, 	specificity: 0.9998, 	f1: 0.9051,	 loss0.2364
+Test Epoch 80: 100%|██████████| 1748/1748 [00:52<00:00, 33.18it/s, loss=1.56]
+Test Epoch 80 ==> 	accuracy: 0.9688, 	precision: 0.9755, 	recall: 0.8618, 	specificity: 0.9948, 	f1: 0.9151, 	loss0.9810
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 81: 100%|██████████| 6137/6137 [08:15<00:00, 12.39it/s, loss=0.0051]
+Train Epoch 81 ==> 	accuracy: 0.9156, 	precision: 0.9997, 	recall: 0.8314, 	specificity: 0.9998, 	f1: 0.9078,	 loss0.2246
+Test Epoch 81: 100%|██████████| 1748/1748 [00:53<00:00, 32.43it/s, loss=0.674]
+Test Epoch 81 ==> 	accuracy: 0.9678, 	precision: 0.9722, 	recall: 0.8598, 	specificity: 0.9940, 	f1: 0.9126, 	loss0.9484
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 82: 100%|██████████| 6137/6137 [08:21<00:00, 12.23it/s, loss=0.0096]
+Train Epoch 82 ==> 	accuracy: 0.9136, 	precision: 0.9997, 	recall: 0.8274, 	specificity: 0.9997, 	f1: 0.9054,	 loss0.2364
+Test Epoch 82: 100%|██████████| 1748/1748 [00:55<00:00, 31.55it/s, loss=0.216]
+Test Epoch 82 ==> 	accuracy: 0.9681, 	precision: 0.9787, 	recall: 0.8549, 	specificity: 0.9955, 	f1: 0.9126, 	loss0.7398
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 83: 100%|██████████| 6137/6137 [08:35<00:00, 11.91it/s, loss=0.0042]
+Train Epoch 83 ==> 	accuracy: 0.9157, 	precision: 0.9997, 	recall: 0.8316, 	specificity: 0.9997, 	f1: 0.9080,	 loss0.2271
+Test Epoch 83: 100%|██████████| 1748/1748 [00:53<00:00, 32.41it/s, loss=0.031]
+Test Epoch 83 ==> 	accuracy: 0.9669, 	precision: 0.9777, 	recall: 0.8499, 	specificity: 0.9953, 	f1: 0.9093, 	loss0.7653
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 84: 100%|██████████| 6137/6137 [08:39<00:00, 11.82it/s, loss=0.0049]
+Train Epoch 84 ==> 	accuracy: 0.9140, 	precision: 0.9997, 	recall: 0.8283, 	specificity: 0.9998, 	f1: 0.9060,	 loss0.2342
+Test Epoch 84: 100%|██████████| 1748/1748 [00:58<00:00, 30.06it/s, loss=0.0884]
+Test Epoch 84 ==> 	accuracy: 0.9681, 	precision: 0.9804, 	recall: 0.8534, 	specificity: 0.9959, 	f1: 0.9125, 	loss0.7369
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 85: 100%|██████████| 6137/6137 [08:31<00:00, 12.00it/s, loss=0.0105]
+Train Epoch 85 ==> 	accuracy: 0.9182, 	precision: 0.9997, 	recall: 0.8367, 	specificity: 0.9997, 	f1: 0.9109,	 loss0.2208
+Test Epoch 85: 100%|██████████| 1748/1748 [00:56<00:00, 31.03it/s, loss=0.179]
+Test Epoch 85 ==> 	accuracy: 0.9686, 	precision: 0.9774, 	recall: 0.8590, 	specificity: 0.9952, 	f1: 0.9144, 	loss0.9125
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 86: 100%|██████████| 6137/6137 [08:40<00:00, 11.79it/s, loss=0.0314]
+Train Epoch 86 ==> 	accuracy: 0.9164, 	precision: 0.9997, 	recall: 0.8330, 	specificity: 0.9998, 	f1: 0.9088,	 loss0.2261
+Test Epoch 86: 100%|██████████| 1748/1748 [00:56<00:00, 30.92it/s, loss=0.0569]
+Test Epoch 86 ==> 	accuracy: 0.9681, 	precision: 0.9773, 	recall: 0.8563, 	specificity: 0.9952, 	f1: 0.9128, 	loss0.8140
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 87: 100%|██████████| 6137/6137 [08:24<00:00, 12.16it/s, loss=0.0002]
+Train Epoch 87 ==> 	accuracy: 0.9181, 	precision: 0.9997, 	recall: 0.8364, 	specificity: 0.9998, 	f1: 0.9108,	 loss0.2233
+Test Epoch 87: 100%|██████████| 1748/1748 [00:55<00:00, 31.50it/s, loss=0.168]
+Test Epoch 87 ==> 	accuracy: 0.9686, 	precision: 0.9777, 	recall: 0.8588, 	specificity: 0.9952, 	f1: 0.9144, 	loss0.9334
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 88: 100%|██████████| 6137/6137 [08:21<00:00, 12.24it/s, loss=0.004]
+Train Epoch 88 ==> 	accuracy: 0.9159, 	precision: 0.9997, 	recall: 0.8321, 	specificity: 0.9998, 	f1: 0.9083,	 loss0.2252
+Test Epoch 88: 100%|██████████| 1748/1748 [00:58<00:00, 29.69it/s, loss=0.0986]
+Test Epoch 88 ==> 	accuracy: 0.9684, 	precision: 0.9792, 	recall: 0.8564, 	specificity: 0.9956, 	f1: 0.9137, 	loss0.8694
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 89: 100%|██████████| 6137/6137 [08:27<00:00, 12.10it/s, loss=0.0018]
+Train Epoch 89 ==> 	accuracy: 0.9198, 	precision: 0.9997, 	recall: 0.8398, 	specificity: 0.9998, 	f1: 0.9128,	 loss0.2174
+Test Epoch 89: 100%|██████████| 1748/1748 [00:53<00:00, 32.70it/s, loss=0.522]
+Test Epoch 89 ==> 	accuracy: 0.9683, 	precision: 0.9769, 	recall: 0.8577, 	specificity: 0.9951, 	f1: 0.9134, 	loss0.8895
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 90: 100%|██████████| 6137/6137 [08:42<00:00, 11.75it/s, loss=0.0053]
+Train Epoch 90 ==> 	accuracy: 0.9181, 	precision: 0.9997, 	recall: 0.8364, 	specificity: 0.9998, 	f1: 0.9108,	 loss0.2253
+Test Epoch 90: 100%|██████████| 1748/1748 [00:53<00:00, 32.56it/s, loss=2.27]
+Test Epoch 90 ==> 	accuracy: 0.9690, 	precision: 0.9787, 	recall: 0.8600, 	specificity: 0.9955, 	f1: 0.9155, 	loss0.9112
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 91: 100%|██████████| 6137/6137 [08:35<00:00, 11.91it/s, loss=0.0236]
+Train Epoch 91 ==> 	accuracy: 0.9184, 	precision: 0.9998, 	recall: 0.8371, 	specificity: 0.9998, 	f1: 0.9112,	 loss0.2195
+Test Epoch 91: 100%|██████████| 1748/1748 [00:53<00:00, 32.61it/s, loss=0.353]
+Test Epoch 91 ==> 	accuracy: 0.9684, 	precision: 0.9816, 	recall: 0.8542, 	specificity: 0.9961, 	f1: 0.9135, 	loss0.8123
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 92: 100%|██████████| 6137/6137 [08:17<00:00, 12.33it/s, loss=0.0034]
+Train Epoch 92 ==> 	accuracy: 0.9184, 	precision: 0.9997, 	recall: 0.8371, 	specificity: 0.9998, 	f1: 0.9112,	 loss0.2227
+Test Epoch 92: 100%|██████████| 1748/1748 [00:55<00:00, 31.24it/s, loss=0.0479]
+Test Epoch 92 ==> 	accuracy: 0.9689, 	precision: 0.9755, 	recall: 0.8624, 	specificity: 0.9947, 	f1: 0.9154, 	loss0.9380
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 93: 100%|██████████| 6137/6137 [08:34<00:00, 11.94it/s, loss=0.0171]
+Train Epoch 93 ==> 	accuracy: 0.9207, 	precision: 0.9997, 	recall: 0.8417, 	specificity: 0.9998, 	f1: 0.9139,	 loss0.2137
+Test Epoch 93: 100%|██████████| 1748/1748 [00:56<00:00, 31.05it/s, loss=0.368]
+Test Epoch 93 ==> 	accuracy: 0.9695, 	precision: 0.9750, 	recall: 0.8660, 	specificity: 0.9946, 	f1: 0.9173, 	loss0.9642
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 94: 100%|██████████| 6137/6137 [08:21<00:00, 12.23it/s, loss=0.0028]
+Train Epoch 94 ==> 	accuracy: 0.9213, 	precision: 0.9997, 	recall: 0.8428, 	specificity: 0.9998, 	f1: 0.9146,	 loss0.2185
+Test Epoch 94: 100%|██████████| 1748/1748 [00:54<00:00, 32.10it/s, loss=0.155]
+Test Epoch 94 ==> 	accuracy: 0.9688, 	precision: 0.9751, 	recall: 0.8624, 	specificity: 0.9947, 	f1: 0.9153, 	loss0.8996
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 95: 100%|██████████| 6137/6137 [08:12<00:00, 12.46it/s, loss=0.0157]
+Train Epoch 95 ==> 	accuracy: 0.9200, 	precision: 0.9997, 	recall: 0.8403, 	specificity: 0.9998, 	f1: 0.9131,	 loss0.2197
+Test Epoch 95: 100%|██████████| 1748/1748 [00:56<00:00, 31.07it/s, loss=0.55]
+Test Epoch 95 ==> 	accuracy: 0.9682, 	precision: 0.9739, 	recall: 0.8602, 	specificity: 0.9944, 	f1: 0.9136, 	loss0.8133
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 96: 100%|██████████| 6137/6137 [08:32<00:00, 11.98it/s, loss=0.0026]
+Train Epoch 96 ==> 	accuracy: 0.9218, 	precision: 0.9997, 	recall: 0.8438, 	specificity: 0.9998, 	f1: 0.9152,	 loss0.2143
+Test Epoch 96: 100%|██████████| 1748/1748 [00:57<00:00, 30.23it/s, loss=0.0736]
+Test Epoch 96 ==> 	accuracy: 0.9697, 	precision: 0.9750, 	recall: 0.8667, 	specificity: 0.9946, 	f1: 0.9177, 	loss0.9487
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 97: 100%|██████████| 6137/6137 [08:42<00:00, 11.76it/s, loss=0.0086]
+Train Epoch 97 ==> 	accuracy: 0.9204, 	precision: 0.9997, 	recall: 0.8410, 	specificity: 0.9998, 	f1: 0.9135,	 loss0.2178
+Test Epoch 97: 100%|██████████| 1748/1748 [00:53<00:00, 32.91it/s, loss=0.0379]
+Test Epoch 97 ==> 	accuracy: 0.9693, 	precision: 0.9787, 	recall: 0.8614, 	specificity: 0.9954, 	f1: 0.9163, 	loss0.8319
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 98: 100%|██████████| 6137/6137 [08:53<00:00, 11.51it/s, loss=0.0083]
+Train Epoch 98 ==> 	accuracy: 0.9231, 	precision: 0.9997, 	recall: 0.8464, 	specificity: 0.9998, 	f1: 0.9167,	 loss0.2119
+Test Epoch 98: 100%|██████████| 1748/1748 [01:02<00:00, 27.99it/s, loss=0.195]
+Test Epoch 98 ==> 	accuracy: 0.9700, 	precision: 0.9754, 	recall: 0.8684, 	specificity: 0.9947, 	f1: 0.9188, 	loss0.8548
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 99: 100%|██████████| 6137/6137 [08:46<00:00, 11.66it/s, loss=0.0167]
+Train Epoch 99 ==> 	accuracy: 0.9208, 	precision: 0.9997, 	recall: 0.8419, 	specificity: 0.9998, 	f1: 0.9141,	 loss0.2205
+Test Epoch 99: 100%|██████████| 1748/1748 [00:57<00:00, 30.24it/s, loss=0.0348]
+Test Epoch 99 ==> 	accuracy: 0.9697, 	precision: 0.9762, 	recall: 0.8658, 	specificity: 0.9949, 	f1: 0.9177, 	loss0.9187
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 100: 100%|██████████| 6137/6137 [08:42<00:00, 11.76it/s, loss=0.007]
+Train Epoch 100 ==> 	accuracy: 0.9234, 	precision: 0.9997, 	recall: 0.8470, 	specificity: 0.9998, 	f1: 0.9170,	 loss0.2081
+Test Epoch 100: 100%|██████████| 1748/1748 [00:57<00:00, 30.18it/s, loss=0.0917]
+Test Epoch 100 ==> 	accuracy: 0.9694, 	precision: 0.9787, 	recall: 0.8617, 	specificity: 0.9955, 	f1: 0.9165, 	loss0.8902
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 101: 100%|██████████| 6137/6137 [08:32<00:00, 11.97it/s, loss=0.0208]
+Train Epoch 101 ==> 	accuracy: 0.9216, 	precision: 0.9997, 	recall: 0.8434, 	specificity: 0.9998, 	f1: 0.9149,	 loss0.2175
+Test Epoch 101: 100%|██████████| 1748/1748 [00:54<00:00, 32.04it/s, loss=0.104]
+Test Epoch 101 ==> 	accuracy: 0.9696, 	precision: 0.9820, 	recall: 0.8599, 	specificity: 0.9962, 	f1: 0.9169, 	loss0.7892
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 102: 100%|██████████| 6137/6137 [08:25<00:00, 12.13it/s, loss=0.0241]
+Train Epoch 102 ==> 	accuracy: 0.9232, 	precision: 0.9997, 	recall: 0.8467, 	specificity: 0.9998, 	f1: 0.9169,	 loss0.2084
+Test Epoch 102: 100%|██████████| 1748/1748 [00:57<00:00, 30.64it/s, loss=3.73]
+Test Epoch 102 ==> 	accuracy: 0.9709, 	precision: 0.9761, 	recall: 0.8724, 	specificity: 0.9948, 	f1: 0.9213, 	loss0.9964
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 103: 100%|██████████| 6137/6137 [08:36<00:00, 11.87it/s, loss=0.0123]
+Train Epoch 103 ==> 	accuracy: 0.9212, 	precision: 0.9997, 	recall: 0.8427, 	specificity: 0.9998, 	f1: 0.9145,	 loss0.2169
+Test Epoch 103: 100%|██████████| 1748/1748 [00:56<00:00, 31.17it/s, loss=2.34]
+Test Epoch 103 ==> 	accuracy: 0.9699, 	precision: 0.9797, 	recall: 0.8638, 	specificity: 0.9957, 	f1: 0.9181, 	loss0.8359
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 104: 100%|██████████| 6137/6137 [08:46<00:00, 11.65it/s, loss=0.197]
+Train Epoch 104 ==> 	accuracy: 0.9248, 	precision: 0.9997, 	recall: 0.8499, 	specificity: 0.9998, 	f1: 0.9187,	 loss0.2069
+Test Epoch 104: 100%|██████████| 1748/1748 [00:54<00:00, 31.86it/s, loss=0.371]
+Test Epoch 104 ==> 	accuracy: 0.9701, 	precision: 0.9754, 	recall: 0.8684, 	specificity: 0.9947, 	f1: 0.9188, 	loss1.0350
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 105: 100%|██████████| 6137/6137 [08:30<00:00, 12.02it/s, loss=0.0328]
+Train Epoch 105 ==> 	accuracy: 0.9245, 	precision: 0.9998, 	recall: 0.8491, 	specificity: 0.9998, 	f1: 0.9183,	 loss0.2068
+Test Epoch 105: 100%|██████████| 1748/1748 [00:55<00:00, 31.68it/s, loss=0.341]
+Test Epoch 105 ==> 	accuracy: 0.9693, 	precision: 0.9798, 	recall: 0.8603, 	specificity: 0.9957, 	f1: 0.9162, 	loss0.8663
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 106: 100%|██████████| 6137/6137 [08:41<00:00, 11.77it/s, loss=0.0097]
+Train Epoch 106 ==> 	accuracy: 0.9239, 	precision: 0.9997, 	recall: 0.8479, 	specificity: 0.9998, 	f1: 0.9176,	 loss0.2111
+Test Epoch 106: 100%|██████████| 1748/1748 [01:00<00:00, 28.87it/s, loss=0.365]
+Test Epoch 106 ==> 	accuracy: 0.9696, 	precision: 0.9734, 	recall: 0.8679, 	specificity: 0.9943, 	f1: 0.9176, 	loss1.1645
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 107: 100%|██████████| 6137/6137 [08:46<00:00, 11.67it/s, loss=0.0133]
+Train Epoch 107 ==> 	accuracy: 0.9243, 	precision: 0.9998, 	recall: 0.8489, 	specificity: 0.9998, 	f1: 0.9182,	 loss0.2049
+Test Epoch 107: 100%|██████████| 1748/1748 [00:55<00:00, 31.73it/s, loss=0.653]
+Test Epoch 107 ==> 	accuracy: 0.9704, 	precision: 0.9755, 	recall: 0.8701, 	specificity: 0.9947, 	f1: 0.9198, 	loss1.0807
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 108: 100%|██████████| 6137/6137 [08:23<00:00, 12.20it/s, loss=0.0022]
+Train Epoch 108 ==> 	accuracy: 0.9231, 	precision: 0.9997, 	recall: 0.8464, 	specificity: 0.9998, 	f1: 0.9167,	 loss0.2112
+Test Epoch 108: 100%|██████████| 1748/1748 [00:54<00:00, 32.06it/s, loss=0.112]
+Test Epoch 108 ==> 	accuracy: 0.9703, 	precision: 0.9767, 	recall: 0.8684, 	specificity: 0.9950, 	f1: 0.9194, 	loss1.0030
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 109: 100%|██████████| 6137/6137 [08:12<00:00, 12.45it/s, loss=0.0036]
+Train Epoch 109 ==> 	accuracy: 0.9256, 	precision: 0.9997, 	recall: 0.8514, 	specificity: 0.9998, 	f1: 0.9196,	 loss0.2055
+Test Epoch 109: 100%|██████████| 1748/1748 [00:54<00:00, 32.32it/s, loss=2.8]
+Test Epoch 109 ==> 	accuracy: 0.9702, 	precision: 0.9786, 	recall: 0.8662, 	specificity: 0.9954, 	f1: 0.9189, 	loss0.9261
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 110: 100%|██████████| 6137/6137 [08:20<00:00, 12.26it/s, loss=0.0013]
+Train Epoch 110 ==> 	accuracy: 0.9242, 	precision: 0.9998, 	recall: 0.8485, 	specificity: 0.9998, 	f1: 0.9179,	 loss0.2082
+Test Epoch 110: 100%|██████████| 1748/1748 [01:02<00:00, 27.87it/s, loss=0.142]
+Test Epoch 110 ==> 	accuracy: 0.9699, 	precision: 0.9776, 	recall: 0.8656, 	specificity: 0.9952, 	f1: 0.9182, 	loss0.9873
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 111: 100%|██████████| 6137/6137 [09:13<00:00, 11.10it/s, loss=0.0005]
+Train Epoch 111 ==> 	accuracy: 0.9260, 	precision: 0.9998, 	recall: 0.8522, 	specificity: 0.9998, 	f1: 0.9201,	 loss0.2016
+Test Epoch 111: 100%|██████████| 1748/1748 [01:05<00:00, 26.72it/s, loss=0.0217]
+Test Epoch 111 ==> 	accuracy: 0.9697, 	precision: 0.9742, 	recall: 0.8679, 	specificity: 0.9944, 	f1: 0.9180, 	loss1.0925
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 112: 100%|██████████| 6137/6137 [09:36<00:00, 10.65it/s, loss=0.0158]
+Train Epoch 112 ==> 	accuracy: 0.9254, 	precision: 0.9998, 	recall: 0.8510, 	specificity: 0.9998, 	f1: 0.9194,	 loss0.2051
+Test Epoch 112: 100%|██████████| 1748/1748 [01:03<00:00, 27.50it/s, loss=0.0419]
+Test Epoch 112 ==> 	accuracy: 0.9701, 	precision: 0.9719, 	recall: 0.8721, 	specificity: 0.9939, 	f1: 0.9193, 	loss1.1477
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 113: 100%|██████████| 6137/6137 [09:18<00:00, 11.00it/s, loss=0.0231]
+Train Epoch 113 ==> 	accuracy: 0.9264, 	precision: 0.9998, 	recall: 0.8529, 	specificity: 0.9998, 	f1: 0.9205,	 loss0.2052
+Test Epoch 113: 100%|██████████| 1748/1748 [01:08<00:00, 25.57it/s, loss=2.55]
+Test Epoch 113 ==> 	accuracy: 0.9709, 	precision: 0.9751, 	recall: 0.8730, 	specificity: 0.9946, 	f1: 0.9212, 	loss1.0459
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 114: 100%|██████████| 6137/6137 [09:21<00:00, 10.94it/s, loss=0.0199]
+Train Epoch 114 ==> 	accuracy: 0.9263, 	precision: 0.9998, 	recall: 0.8528, 	specificity: 0.9998, 	f1: 0.9205,	 loss0.2045
+Test Epoch 114: 100%|██████████| 1748/1748 [01:06<00:00, 26.46it/s, loss=0.189]
+Test Epoch 114 ==> 	accuracy: 0.9706, 	precision: 0.9720, 	recall: 0.8746, 	specificity: 0.9939, 	f1: 0.9207, 	loss1.1564
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 115: 100%|██████████| 6137/6137 [09:11<00:00, 11.13it/s, loss=0.0069]
+Train Epoch 115 ==> 	accuracy: 0.9278, 	precision: 0.9998, 	recall: 0.8559, 	specificity: 0.9998, 	f1: 0.9222,	 loss0.1992
+Test Epoch 115: 100%|██████████| 1748/1748 [01:03<00:00, 27.73it/s, loss=0.163]
+Test Epoch 115 ==> 	accuracy: 0.9710, 	precision: 0.9734, 	recall: 0.8752, 	specificity: 0.9942, 	f1: 0.9217, 	loss1.1390
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 116: 100%|██████████| 6137/6137 [09:34<00:00, 10.68it/s, loss=0.0033]
+Train Epoch 116 ==> 	accuracy: 0.9260, 	precision: 0.9998, 	recall: 0.8522, 	specificity: 0.9998, 	f1: 0.9201,	 loss0.2058
+Test Epoch 116: 100%|██████████| 1748/1748 [01:04<00:00, 27.04it/s, loss=0.132]
+Test Epoch 116 ==> 	accuracy: 0.9705, 	precision: 0.9714, 	recall: 0.8744, 	specificity: 0.9938, 	f1: 0.9203, 	loss1.1795
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 117: 100%|██████████| 6137/6137 [09:20<00:00, 10.96it/s, loss=0.001]
+Train Epoch 117 ==> 	accuracy: 0.9280, 	precision: 0.9998, 	recall: 0.8561, 	specificity: 0.9998, 	f1: 0.9224,	 loss0.1997
+Test Epoch 117: 100%|██████████| 1748/1748 [01:03<00:00, 27.72it/s, loss=1.76]
+Test Epoch 117 ==> 	accuracy: 0.9710, 	precision: 0.9752, 	recall: 0.8737, 	specificity: 0.9946, 	f1: 0.9217, 	loss1.1063
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 118: 100%|██████████| 6137/6137 [09:29<00:00, 10.78it/s, loss=0.0018]
+Train Epoch 118 ==> 	accuracy: 0.9277, 	precision: 0.9997, 	recall: 0.8555, 	specificity: 0.9998, 	f1: 0.9220,	 loss0.2004
+Test Epoch 118: 100%|██████████| 1748/1748 [01:03<00:00, 27.41it/s, loss=0.168]
+Test Epoch 118 ==> 	accuracy: 0.9705, 	precision: 0.9755, 	recall: 0.8706, 	specificity: 0.9947, 	f1: 0.9201, 	loss1.0761
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 119: 100%|██████████| 6137/6137 [09:31<00:00, 10.75it/s, loss=0.003]
+Train Epoch 119 ==> 	accuracy: 0.9259, 	precision: 0.9998, 	recall: 0.8519, 	specificity: 0.9998, 	f1: 0.9200,	 loss0.2049
+Test Epoch 119: 100%|██████████| 1748/1748 [01:05<00:00, 26.52it/s, loss=0.87]
+Test Epoch 119 ==> 	accuracy: 0.9721, 	precision: 0.9794, 	recall: 0.8753, 	specificity: 0.9955, 	f1: 0.9244, 	loss0.9689
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 120: 100%|██████████| 6137/6137 [09:38<00:00, 10.61it/s, loss=0.0118]
+Train Epoch 120 ==> 	accuracy: 0.9270, 	precision: 0.9998, 	recall: 0.8543, 	specificity: 0.9998, 	f1: 0.9213,	 loss0.2025
+Test Epoch 120: 100%|██████████| 1748/1748 [01:06<00:00, 26.20it/s, loss=0.644]
+Test Epoch 120 ==> 	accuracy: 0.9719, 	precision: 0.9790, 	recall: 0.8746, 	specificity: 0.9955, 	f1: 0.9238, 	loss1.0515
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 121: 100%|██████████| 6137/6137 [09:37<00:00, 10.63it/s, loss=0.0213]
+Train Epoch 121 ==> 	accuracy: 0.9259, 	precision: 0.9998, 	recall: 0.8520, 	specificity: 0.9998, 	f1: 0.9200,	 loss0.2081
+Test Epoch 121: 100%|██████████| 1748/1748 [01:07<00:00, 26.06it/s, loss=0.177]
+Test Epoch 121 ==> 	accuracy: 0.9718, 	precision: 0.9791, 	recall: 0.8743, 	specificity: 0.9955, 	f1: 0.9237, 	loss1.0376
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 122: 100%|██████████| 6137/6137 [09:42<00:00, 10.53it/s, loss=0.0087]
+Train Epoch 122 ==> 	accuracy: 0.9280, 	precision: 0.9998, 	recall: 0.8561, 	specificity: 0.9998, 	f1: 0.9224,	 loss0.1974
+Test Epoch 122: 100%|██████████| 1748/1748 [01:04<00:00, 26.96it/s, loss=0.0602]
+Test Epoch 122 ==> 	accuracy: 0.9707, 	precision: 0.9827, 	recall: 0.8653, 	specificity: 0.9963, 	f1: 0.9203, 	loss0.8295
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 123: 100%|██████████| 6137/6137 [09:42<00:00, 10.54it/s, loss=0.0105]
+Train Epoch 123 ==> 	accuracy: 0.9255, 	precision: 0.9998, 	recall: 0.8512, 	specificity: 0.9998, 	f1: 0.9195,	 loss0.2085
+Test Epoch 123: 100%|██████████| 1748/1748 [01:09<00:00, 25.04it/s, loss=0.122]
+Test Epoch 123 ==> 	accuracy: 0.9714, 	precision: 0.9805, 	recall: 0.8709, 	specificity: 0.9958, 	f1: 0.9225, 	loss0.9130
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 124: 100%|██████████| 6137/6137 [09:38<00:00, 10.60it/s, loss=0.0319]
+Train Epoch 124 ==> 	accuracy: 0.9286, 	precision: 0.9998, 	recall: 0.8574, 	specificity: 0.9998, 	f1: 0.9232,	 loss0.1957
+Test Epoch 124: 100%|██████████| 1748/1748 [01:01<00:00, 28.38it/s, loss=0.0855]
+Test Epoch 124 ==> 	accuracy: 0.9719, 	precision: 0.9777, 	recall: 0.8761, 	specificity: 0.9952, 	f1: 0.9241, 	loss1.0654
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 125: 100%|██████████| 6137/6137 [09:17<00:00, 11.01it/s, loss=0.0147]
+Train Epoch 125 ==> 	accuracy: 0.9262, 	precision: 0.9998, 	recall: 0.8526, 	specificity: 0.9998, 	f1: 0.9203,	 loss0.2081
+Test Epoch 125: 100%|██████████| 1748/1748 [01:06<00:00, 26.25it/s, loss=0.103]
+Test Epoch 125 ==> 	accuracy: 0.9716, 	precision: 0.9794, 	recall: 0.8729, 	specificity: 0.9955, 	f1: 0.9231, 	loss0.9625
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 126: 100%|██████████| 6137/6137 [09:22<00:00, 10.90it/s, loss=0.0038]
+Train Epoch 126 ==> 	accuracy: 0.9293, 	precision: 0.9998, 	recall: 0.8588, 	specificity: 0.9998, 	f1: 0.9239,	 loss0.1943
+Test Epoch 126: 100%|██████████| 1748/1748 [01:02<00:00, 28.18it/s, loss=0.202]
+Test Epoch 126 ==> 	accuracy: 0.9714, 	precision: 0.9778, 	recall: 0.8734, 	specificity: 0.9952, 	f1: 0.9226, 	loss1.0817
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 127: 100%|██████████| 6137/6137 [09:24<00:00, 10.88it/s, loss=0.0265]
+Train Epoch 127 ==> 	accuracy: 0.9272, 	precision: 0.9998, 	recall: 0.8547, 	specificity: 0.9998, 	f1: 0.9215,	 loss0.2035
+Test Epoch 127: 100%|██████████| 1748/1748 [01:06<00:00, 26.13it/s, loss=2.01]
+Test Epoch 127 ==> 	accuracy: 0.9710, 	precision: 0.9783, 	recall: 0.8707, 	specificity: 0.9953, 	f1: 0.9214, 	loss1.0091
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 128: 100%|██████████| 6137/6137 [09:25<00:00, 10.86it/s, loss=0.0031]
+Train Epoch 128 ==> 	accuracy: 0.9302, 	precision: 0.9998, 	recall: 0.8606, 	specificity: 0.9998, 	f1: 0.9250,	 loss0.1943
+Test Epoch 128: 100%|██████████| 1748/1748 [01:11<00:00, 24.35it/s, loss=0.0449]
+Test Epoch 128 ==> 	accuracy: 0.9714, 	precision: 0.9776, 	recall: 0.8734, 	specificity: 0.9952, 	f1: 0.9226, 	loss1.1153
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 129: 100%|██████████| 6137/6137 [09:36<00:00, 10.64it/s, loss=0.0047]
+Train Epoch 129 ==> 	accuracy: 0.9275, 	precision: 0.9998, 	recall: 0.8551, 	specificity: 0.9998, 	f1: 0.9218,	 loss0.2019
+Test Epoch 129: 100%|██████████| 1748/1748 [01:06<00:00, 26.34it/s, loss=0.19]
+Test Epoch 129 ==> 	accuracy: 0.9706, 	precision: 0.9812, 	recall: 0.8661, 	specificity: 0.9960, 	f1: 0.9201, 	loss0.9641
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 130: 100%|██████████| 6137/6137 [09:29<00:00, 10.78it/s, loss=0.0058]
+Train Epoch 130 ==> 	accuracy: 0.9283, 	precision: 0.9998, 	recall: 0.8567, 	specificity: 0.9998, 	f1: 0.9227,	 loss0.1968
+Test Epoch 130: 100%|██████████| 1748/1748 [01:11<00:00, 24.40it/s, loss=1.79]
+Test Epoch 130 ==> 	accuracy: 0.9719, 	precision: 0.9786, 	recall: 0.8750, 	specificity: 0.9954, 	f1: 0.9239, 	loss1.0391
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 131: 100%|██████████| 6137/6137 [09:26<00:00, 10.83it/s, loss=0.0105]
+Train Epoch 131 ==> 	accuracy: 0.9297, 	precision: 0.9998, 	recall: 0.8595, 	specificity: 0.9998, 	f1: 0.9244,	 loss0.1955
+Test Epoch 131: 100%|██████████| 1748/1748 [01:07<00:00, 26.01it/s, loss=3.13]
+Test Epoch 131 ==> 	accuracy: 0.9720, 	precision: 0.9758, 	recall: 0.8782, 	specificity: 0.9947, 	f1: 0.9244, 	loss1.1324
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 132: 100%|██████████| 6137/6137 [09:32<00:00, 10.71it/s, loss=0.0019]
+Train Epoch 132 ==> 	accuracy: 0.9290, 	precision: 0.9998, 	recall: 0.8582, 	specificity: 0.9998, 	f1: 0.9236,	 loss0.1995
+Test Epoch 132: 100%|██████████| 1748/1748 [01:08<00:00, 25.51it/s, loss=0.106]
+Test Epoch 132 ==> 	accuracy: 0.9719, 	precision: 0.9755, 	recall: 0.8782, 	specificity: 0.9946, 	f1: 0.9243, 	loss1.1603
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 133: 100%|██████████| 6137/6137 [09:32<00:00, 10.72it/s, loss=0.0102]
+Train Epoch 133 ==> 	accuracy: 0.9299, 	precision: 0.9998, 	recall: 0.8600, 	specificity: 0.9998, 	f1: 0.9246,	 loss0.1959
+Test Epoch 133: 100%|██████████| 1748/1748 [01:10<00:00, 24.85it/s, loss=0.0478]
+Test Epoch 133 ==> 	accuracy: 0.9722, 	precision: 0.9746, 	recall: 0.8807, 	specificity: 0.9944, 	f1: 0.9252, 	loss1.1277
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 134: 100%|██████████| 6137/6137 [09:36<00:00, 10.64it/s, loss=0.0007]
+Train Epoch 134 ==> 	accuracy: 0.9286, 	precision: 0.9998, 	recall: 0.8575, 	specificity: 0.9998, 	f1: 0.9232,	 loss0.1979
+Test Epoch 134: 100%|██████████| 1748/1748 [01:08<00:00, 25.51it/s, loss=0.0487]
+Test Epoch 134 ==> 	accuracy: 0.9714, 	precision: 0.9778, 	recall: 0.8735, 	specificity: 0.9952, 	f1: 0.9227, 	loss1.0739
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 135: 100%|██████████| 6137/6137 [09:27<00:00, 10.80it/s, loss=0.0365]
+Train Epoch 135 ==> 	accuracy: 0.9302, 	precision: 0.9998, 	recall: 0.8605, 	specificity: 0.9998, 	f1: 0.9249,	 loss0.1941
+Test Epoch 135: 100%|██████████| 1748/1748 [01:06<00:00, 26.30it/s, loss=0.0898]
+Test Epoch 135 ==> 	accuracy: 0.9718, 	precision: 0.9747, 	recall: 0.8783, 	specificity: 0.9945, 	f1: 0.9240, 	loss1.1860
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 136: 100%|██████████| 6137/6137 [09:31<00:00, 10.74it/s, loss=0.0101]
+Train Epoch 136 ==> 	accuracy: 0.9301, 	precision: 0.9998, 	recall: 0.8603, 	specificity: 0.9998, 	f1: 0.9248,	 loss0.1952
+Test Epoch 136: 100%|██████████| 1748/1748 [01:08<00:00, 25.35it/s, loss=0.106]
+Test Epoch 136 ==> 	accuracy: 0.9718, 	precision: 0.9764, 	recall: 0.8766, 	specificity: 0.9949, 	f1: 0.9238, 	loss1.1424
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 137: 100%|██████████| 6137/6137 [09:25<00:00, 10.86it/s, loss=0.0134]
+Train Epoch 137 ==> 	accuracy: 0.9304, 	precision: 0.9998, 	recall: 0.8609, 	specificity: 0.9998, 	f1: 0.9252,	 loss0.1940
+Test Epoch 137: 100%|██████████| 1748/1748 [01:03<00:00, 27.40it/s, loss=0.0925]
+Test Epoch 137 ==> 	accuracy: 0.9719, 	precision: 0.9745, 	recall: 0.8792, 	specificity: 0.9944, 	f1: 0.9244, 	loss1.1871
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 138: 100%|██████████| 6137/6137 [09:16<00:00, 11.03it/s, loss=0.356]
+Train Epoch 138 ==> 	accuracy: 0.9300, 	precision: 0.9998, 	recall: 0.8601, 	specificity: 0.9998, 	f1: 0.9247,	 loss0.1963
+Test Epoch 138: 100%|██████████| 1748/1748 [01:03<00:00, 27.62it/s, loss=0.717]
+Test Epoch 138 ==> 	accuracy: 0.9719, 	precision: 0.9762, 	recall: 0.8775, 	specificity: 0.9948, 	f1: 0.9242, 	loss1.2098
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 139: 100%|██████████| 6137/6137 [09:20<00:00, 10.94it/s, loss=0.0232]
+Train Epoch 139 ==> 	accuracy: 0.9310, 	precision: 0.9998, 	recall: 0.8623, 	specificity: 0.9998, 	f1: 0.9259,	 loss0.1928
+Test Epoch 139: 100%|██████████| 1748/1748 [01:05<00:00, 26.89it/s, loss=0.0657]
+Test Epoch 139 ==> 	accuracy: 0.9720, 	precision: 0.9741, 	recall: 0.8799, 	specificity: 0.9943, 	f1: 0.9246, 	loss1.1988
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 140: 100%|██████████| 6137/6137 [09:19<00:00, 10.96it/s, loss=0.0088]
+Train Epoch 140 ==> 	accuracy: 0.9296, 	precision: 0.9998, 	recall: 0.8595, 	specificity: 0.9998, 	f1: 0.9243,	 loss0.1986
+Test Epoch 140: 100%|██████████| 1748/1748 [01:04<00:00, 27.17it/s, loss=0.358]
+Test Epoch 140 ==> 	accuracy: 0.9716, 	precision: 0.9779, 	recall: 0.8742, 	specificity: 0.9952, 	f1: 0.9232, 	loss1.0610
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 141: 100%|██████████| 6137/6137 [09:25<00:00, 10.85it/s, loss=0.0018]
+Train Epoch 141 ==> 	accuracy: 0.9299, 	precision: 0.9998, 	recall: 0.8600, 	specificity: 0.9998, 	f1: 0.9247,	 loss0.1935
+Test Epoch 141: 100%|██████████| 1748/1748 [01:03<00:00, 27.67it/s, loss=0.213]
+Test Epoch 141 ==> 	accuracy: 0.9718, 	precision: 0.9746, 	recall: 0.8785, 	specificity: 0.9944, 	f1: 0.9241, 	loss1.1626
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 142: 100%|██████████| 6137/6137 [09:10<00:00, 11.14it/s, loss=0.0142]
+Train Epoch 142 ==> 	accuracy: 0.9298, 	precision: 0.9998, 	recall: 0.8598, 	specificity: 0.9998, 	f1: 0.9245,	 loss0.1986
+Test Epoch 142: 100%|██████████| 1748/1748 [01:00<00:00, 29.06it/s, loss=0.102]
+Test Epoch 142 ==> 	accuracy: 0.9710, 	precision: 0.9775, 	recall: 0.8713, 	specificity: 0.9951, 	f1: 0.9214, 	loss1.0285
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 143: 100%|██████████| 6137/6137 [09:24<00:00, 10.87it/s, loss=0.0178]
+Train Epoch 143 ==> 	accuracy: 0.9319, 	precision: 0.9998, 	recall: 0.8640, 	specificity: 0.9998, 	f1: 0.9269,	 loss0.1878
+Test Epoch 143: 100%|██████████| 1748/1748 [01:00<00:00, 28.68it/s, loss=0.066]
+Test Epoch 143 ==> 	accuracy: 0.9720, 	precision: 0.9738, 	recall: 0.8799, 	specificity: 0.9943, 	f1: 0.9245, 	loss1.3140
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 144: 100%|██████████| 6137/6137 [09:03<00:00, 11.28it/s, loss=0.0157]
+Train Epoch 144 ==> 	accuracy: 0.9299, 	precision: 0.9998, 	recall: 0.8600, 	specificity: 0.9998, 	f1: 0.9246,	 loss0.1966
+Test Epoch 144: 100%|██████████| 1748/1748 [00:59<00:00, 29.22it/s, loss=0.0392]
+Test Epoch 144 ==> 	accuracy: 0.9719, 	precision: 0.9768, 	recall: 0.8768, 	specificity: 0.9950, 	f1: 0.9241, 	loss1.1390
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 145: 100%|██████████| 6137/6137 [09:11<00:00, 11.13it/s, loss=0.026]
+Train Epoch 145 ==> 	accuracy: 0.9297, 	precision: 0.9998, 	recall: 0.8596, 	specificity: 0.9998, 	f1: 0.9244,	 loss0.1947
+Test Epoch 145: 100%|██████████| 1748/1748 [01:01<00:00, 28.55it/s, loss=1.02]
+Test Epoch 145 ==> 	accuracy: 0.9720, 	precision: 0.9773, 	recall: 0.8768, 	specificity: 0.9951, 	f1: 0.9243, 	loss1.0625
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 146: 100%|██████████| 6137/6137 [08:52<00:00, 11.52it/s, loss=0.0022]
+Train Epoch 146 ==> 	accuracy: 0.9308, 	precision: 0.9998, 	recall: 0.8619, 	specificity: 0.9998, 	f1: 0.9257,	 loss0.1952
+Test Epoch 146: 100%|██████████| 1748/1748 [00:56<00:00, 30.80it/s, loss=0.291]
+Test Epoch 146 ==> 	accuracy: 0.9719, 	precision: 0.9783, 	recall: 0.8755, 	specificity: 0.9953, 	f1: 0.9240, 	loss1.0050
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 147: 100%|██████████| 6137/6137 [09:11<00:00, 11.12it/s, loss=0.0133]
+Train Epoch 147 ==> 	accuracy: 0.9314, 	precision: 0.9998, 	recall: 0.8631, 	specificity: 0.9998, 	f1: 0.9264,	 loss0.1914
+Test Epoch 147: 100%|██████████| 1748/1748 [01:01<00:00, 28.22it/s, loss=1.64]
+Test Epoch 147 ==> 	accuracy: 0.9721, 	precision: 0.9748, 	recall: 0.8800, 	specificity: 0.9945, 	f1: 0.9249, 	loss1.1477
+Adjusting learning rate of group 0 to 5.8150e-06.
+Train Epoch 148: 100%|██████████| 6137/6137 [09:04<00:00, 11.28it/s, loss=0.0126]
+Train Epoch 148 ==> 	accuracy: 0.9318, 	precision: 0.9998, 	recall: 0.8637, 	specificity: 0.9998, 	f1: 0.9268,	 loss0.1903
+Test Epoch 148: 100%|██████████| 1748/1748 [01:05<00:00, 26.81it/s, loss=0.414]
+Test Epoch 148 ==> 	accuracy: 0.9725, 	precision: 0.9754, 	recall: 0.8812, 	specificity: 0.9946, 	f1: 0.9259, 	loss1.1898
+Adjusting learning rate of group 0 to 5.8150e-06.
+Train Epoch 149: 100%|██████████| 6137/6137 [09:11<00:00, 11.12it/s, loss=0.0116]
+Train Epoch 149 ==> 	accuracy: 0.9307, 	precision: 0.9998, 	recall: 0.8616, 	specificity: 0.9998, 	f1: 0.9256,	 loss0.1932
+Test Epoch 149: 100%|██████████| 1748/1748 [01:00<00:00, 28.72it/s, loss=3.04]
+Test Epoch 149 ==> 	accuracy: 0.9719, 	precision: 0.9754, 	recall: 0.8784, 	specificity: 0.9946, 	f1: 0.9243, 	loss1.1588
+Adjusting learning rate of group 0 to 5.8150e-06.
+
+进程已结束，退出代码为 0
+
+'''
+'''
+3407
+/home/bio/anaconda3/bin/python /home/bio/bio_seq/oxog/oxog/script/train.py 
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 0: 100%|██████████| 6137/6137 [08:40<00:00, 11.79it/s, loss=0.0405]
+Train Epoch 0 ==> 	accuracy: 0.6426, 	precision: 0.9958, 	recall: 0.2863, 	specificity: 0.9988, 	f1: 0.4448,	 loss1.1163
+Test Epoch 0: 100%|██████████| 1748/1748 [01:00<00:00, 28.72it/s, loss=0.674]
+Test Epoch 0 ==> 	accuracy: 0.9190, 	precision: 0.9149, 	recall: 0.6451, 	specificity: 0.9855, 	f1: 0.7567, 	loss1.3797
+Train Epoch 1: 100%|██████████| 6137/6137 [09:28<00:00, 10.80it/s, loss=0.103]
+Train Epoch 1 ==> 	accuracy: 0.7572, 	precision: 0.9975, 	recall: 0.5157, 	specificity: 0.9987, 	f1: 0.6799,	 loss0.8585
+Test Epoch 1: 100%|██████████| 1748/1748 [01:04<00:00, 27.18it/s, loss=0.631]
+Test Epoch 1 ==> 	accuracy: 0.9296, 	precision: 0.9681, 	recall: 0.6609, 	specificity: 0.9947, 	f1: 0.7855, 	loss0.7200
+Train Epoch 2: 100%|██████████| 6137/6137 [09:35<00:00, 10.67it/s, loss=0.0893]
+Train Epoch 2 ==> 	accuracy: 0.7916, 	precision: 0.9981, 	recall: 0.5844, 	specificity: 0.9989, 	f1: 0.7371,	 loss0.7665
+Test Epoch 2: 100%|██████████| 1748/1748 [01:01<00:00, 28.30it/s, loss=0.365]
+Test Epoch 2 ==> 	accuracy: 0.9333, 	precision: 0.9774, 	recall: 0.6738, 	specificity: 0.9962, 	f1: 0.7977, 	loss0.6978
+Train Epoch 3: 100%|██████████| 6137/6137 [09:19<00:00, 10.97it/s, loss=0.14]
+Train Epoch 3 ==> 	accuracy: 0.8001, 	precision: 0.9984, 	recall: 0.6011, 	specificity: 0.9991, 	f1: 0.7504,	 loss0.7495
+Test Epoch 3: 100%|██████████| 1748/1748 [01:02<00:00, 28.05it/s, loss=0.387]
+Test Epoch 3 ==> 	accuracy: 0.9424, 	precision: 0.9743, 	recall: 0.7238, 	specificity: 0.9954, 	f1: 0.8306, 	loss0.7240
+Train Epoch 4: 100%|██████████| 6137/6137 [09:42<00:00, 10.53it/s, loss=0.598]
+Train Epoch 4 ==> 	accuracy: 0.8122, 	precision: 0.9986, 	recall: 0.6252, 	specificity: 0.9991, 	f1: 0.7690,	 loss0.7122
+Test Epoch 4: 100%|██████████| 1748/1748 [01:02<00:00, 28.08it/s, loss=0.3]
+Test Epoch 4 ==> 	accuracy: 0.9387, 	precision: 0.9663, 	recall: 0.7105, 	specificity: 0.9940, 	f1: 0.8189, 	loss0.7379
+Train Epoch 5: 100%|██████████| 6137/6137 [09:42<00:00, 10.54it/s, loss=0.193]
+Train Epoch 5 ==> 	accuracy: 0.8212, 	precision: 0.9987, 	recall: 0.6433, 	specificity: 0.9992, 	f1: 0.7825,	 loss0.6926
+Test Epoch 5: 100%|██████████| 1748/1748 [01:02<00:00, 27.90it/s, loss=0.2]
+Test Epoch 5 ==> 	accuracy: 0.9367, 	precision: 0.9880, 	recall: 0.6838, 	specificity: 0.9980, 	f1: 0.8082, 	loss0.4957
+Train Epoch 6: 100%|██████████| 6137/6137 [09:35<00:00, 10.66it/s, loss=0.141]
+Train Epoch 6 ==> 	accuracy: 0.8270, 	precision: 0.9988, 	recall: 0.6548, 	specificity: 0.9992, 	f1: 0.7910,	 loss0.6776
+Test Epoch 6: 100%|██████████| 1748/1748 [01:04<00:00, 27.01it/s, loss=0.449]
+Test Epoch 6 ==> 	accuracy: 0.9395, 	precision: 0.9701, 	recall: 0.7116, 	specificity: 0.9947, 	f1: 0.8210, 	loss0.6954
+Train Epoch 7: 100%|██████████| 6137/6137 [09:43<00:00, 10.52it/s, loss=0.117]
+Train Epoch 7 ==> 	accuracy: 0.8324, 	precision: 0.9989, 	recall: 0.6656, 	specificity: 0.9992, 	f1: 0.7989,	 loss0.6573
+Test Epoch 7: 100%|██████████| 1748/1748 [01:00<00:00, 29.00it/s, loss=0.114]
+Test Epoch 7 ==> 	accuracy: 0.9469, 	precision: 0.9820, 	recall: 0.7415, 	specificity: 0.9967, 	f1: 0.8450, 	loss0.5101
+Train Epoch 8: 100%|██████████| 6137/6137 [09:50<00:00, 10.40it/s, loss=0.123]
+Train Epoch 8 ==> 	accuracy: 0.8343, 	precision: 0.9989, 	recall: 0.6693, 	specificity: 0.9993, 	f1: 0.8016,	 loss0.6585
+Test Epoch 8: 100%|██████████| 1748/1748 [01:03<00:00, 27.72it/s, loss=0.282]
+Test Epoch 8 ==> 	accuracy: 0.9380, 	precision: 0.9907, 	recall: 0.6889, 	specificity: 0.9984, 	f1: 0.8127, 	loss0.4014
+Train Epoch 9: 100%|██████████| 6137/6137 [09:55<00:00, 10.31it/s, loss=0.0982]
+Train Epoch 9 ==> 	accuracy: 0.8394, 	precision: 0.9990, 	recall: 0.6795, 	specificity: 0.9993, 	f1: 0.8088,	 loss0.6415
+Test Epoch 9: 100%|██████████| 1748/1748 [01:03<00:00, 27.57it/s, loss=0.533]
+Test Epoch 9 ==> 	accuracy: 0.9448, 	precision: 0.9832, 	recall: 0.7294, 	specificity: 0.9970, 	f1: 0.8375, 	loss0.5083
+Train Epoch 10: 100%|██████████| 6137/6137 [09:43<00:00, 10.52it/s, loss=0.122]
+Train Epoch 10 ==> 	accuracy: 0.8418, 	precision: 0.9991, 	recall: 0.6843, 	specificity: 0.9994, 	f1: 0.8122,	 loss0.6352
+Test Epoch 10: 100%|██████████| 1748/1748 [01:01<00:00, 28.28it/s, loss=0.184]
+Test Epoch 10 ==> 	accuracy: 0.9377, 	precision: 0.9855, 	recall: 0.6906, 	specificity: 0.9975, 	f1: 0.8121, 	loss0.4933
+Train Epoch 11: 100%|██████████| 6137/6137 [09:48<00:00, 10.43it/s, loss=0.149]
+Train Epoch 11 ==> 	accuracy: 0.8450, 	precision: 0.9991, 	recall: 0.6907, 	specificity: 0.9994, 	f1: 0.8167,	 loss0.6236
+Test Epoch 11: 100%|██████████| 1748/1748 [01:02<00:00, 27.97it/s, loss=1.01]
+Test Epoch 11 ==> 	accuracy: 0.9496, 	precision: 0.9712, 	recall: 0.7645, 	specificity: 0.9945, 	f1: 0.8555, 	loss0.8293
+Train Epoch 12: 100%|██████████| 6137/6137 [10:00<00:00, 10.22it/s, loss=0.125]
+Train Epoch 12 ==> 	accuracy: 0.8447, 	precision: 0.9991, 	recall: 0.6901, 	specificity: 0.9993, 	f1: 0.8163,	 loss0.6250
+Test Epoch 12: 100%|██████████| 1748/1748 [01:04<00:00, 27.17it/s, loss=0.343]
+Test Epoch 12 ==> 	accuracy: 0.9416, 	precision: 0.9891, 	recall: 0.7084, 	specificity: 0.9981, 	f1: 0.8255, 	loss0.4472
+Train Epoch 13: 100%|██████████| 6137/6137 [09:43<00:00, 10.51it/s, loss=0.0614]
+Train Epoch 13 ==> 	accuracy: 0.8507, 	precision: 0.9991, 	recall: 0.7019, 	specificity: 0.9994, 	f1: 0.8246,	 loss0.6099
+Test Epoch 13: 100%|██████████| 1748/1748 [01:01<00:00, 28.41it/s, loss=0.0825]
+Test Epoch 13 ==> 	accuracy: 0.9470, 	precision: 0.9757, 	recall: 0.7472, 	specificity: 0.9955, 	f1: 0.8463, 	loss0.5886
+Train Epoch 14: 100%|██████████| 6137/6137 [09:38<00:00, 10.61it/s, loss=0.127]
+Train Epoch 14 ==> 	accuracy: 0.8537, 	precision: 0.9992, 	recall: 0.7081, 	specificity: 0.9994, 	f1: 0.8288,	 loss0.5973
+Test Epoch 14: 100%|██████████| 1748/1748 [01:04<00:00, 27.11it/s, loss=0.0548]
+Test Epoch 14 ==> 	accuracy: 0.9496, 	precision: 0.9828, 	recall: 0.7547, 	specificity: 0.9968, 	f1: 0.8538, 	loss0.5417
+Train Epoch 15: 100%|██████████| 6137/6137 [09:21<00:00, 10.93it/s, loss=0.0826]
+Train Epoch 15 ==> 	accuracy: 0.8505, 	precision: 0.9992, 	recall: 0.7016, 	specificity: 0.9995, 	f1: 0.8243,	 loss0.6061
+Test Epoch 15: 100%|██████████| 1748/1748 [00:59<00:00, 29.52it/s, loss=0.178]
+Test Epoch 15 ==> 	accuracy: 0.9463, 	precision: 0.9777, 	recall: 0.7417, 	specificity: 0.9959, 	f1: 0.8435, 	loss0.5898
+Train Epoch 16: 100%|██████████| 6137/6137 [09:35<00:00, 10.66it/s, loss=0.128]
+Train Epoch 16 ==> 	accuracy: 0.8525, 	precision: 0.9992, 	recall: 0.7056, 	specificity: 0.9995, 	f1: 0.8272,	 loss0.6003
+Test Epoch 16: 100%|██████████| 1748/1748 [01:00<00:00, 28.88it/s, loss=0.094]
+Test Epoch 16 ==> 	accuracy: 0.9491, 	precision: 0.9896, 	recall: 0.7470, 	specificity: 0.9981, 	f1: 0.8514, 	loss0.3913
+Train Epoch 17: 100%|██████████| 6137/6137 [09:52<00:00, 10.36it/s, loss=0.113]
+Train Epoch 17 ==> 	accuracy: 0.8549, 	precision: 0.9993, 	recall: 0.7104, 	specificity: 0.9995, 	f1: 0.8304,	 loss0.5947
+Test Epoch 17: 100%|██████████| 1748/1748 [01:00<00:00, 29.00it/s, loss=0.155]
+Test Epoch 17 ==> 	accuracy: 0.9461, 	precision: 0.9775, 	recall: 0.7410, 	specificity: 0.9959, 	f1: 0.8430, 	loss0.6938
+Train Epoch 18: 100%|██████████| 6137/6137 [09:29<00:00, 10.78it/s, loss=0.0966]
+Train Epoch 18 ==> 	accuracy: 0.8597, 	precision: 0.9993, 	recall: 0.7199, 	specificity: 0.9995, 	f1: 0.8369,	 loss0.5840
+Test Epoch 18: 100%|██████████| 1748/1748 [01:01<00:00, 28.28it/s, loss=0.209]
+Test Epoch 18 ==> 	accuracy: 0.9521, 	precision: 0.9841, 	recall: 0.7668, 	specificity: 0.9970, 	f1: 0.8619, 	loss0.4688
+Train Epoch 19: 100%|██████████| 6137/6137 [09:35<00:00, 10.67it/s, loss=0.417]
+Train Epoch 19 ==> 	accuracy: 0.8598, 	precision: 0.9993, 	recall: 0.7201, 	specificity: 0.9995, 	f1: 0.8371,	 loss0.5810
+Test Epoch 19: 100%|██████████| 1748/1748 [00:57<00:00, 30.53it/s, loss=0.342]
+Test Epoch 19 ==> 	accuracy: 0.9543, 	precision: 0.9725, 	recall: 0.7879, 	specificity: 0.9946, 	f1: 0.8705, 	loss0.7393
+Train Epoch 20: 100%|██████████| 6137/6137 [09:28<00:00, 10.80it/s, loss=0.133]
+Train Epoch 20 ==> 	accuracy: 0.8603, 	precision: 0.9993, 	recall: 0.7211, 	specificity: 0.9995, 	f1: 0.8377,	 loss0.5845
+Test Epoch 20: 100%|██████████| 1748/1748 [01:01<00:00, 28.38it/s, loss=0.111]
+Test Epoch 20 ==> 	accuracy: 0.9496, 	precision: 0.9914, 	recall: 0.7481, 	specificity: 0.9984, 	f1: 0.8528, 	loss0.3905
+Train Epoch 21: 100%|██████████| 6137/6137 [09:17<00:00, 11.01it/s, loss=0.0784]
+Train Epoch 21 ==> 	accuracy: 0.8655, 	precision: 0.9993, 	recall: 0.7316, 	specificity: 0.9995, 	f1: 0.8448,	 loss0.5690
+Test Epoch 21: 100%|██████████| 1748/1748 [01:01<00:00, 28.51it/s, loss=0.11]
+Test Epoch 21 ==> 	accuracy: 0.9531, 	precision: 0.9782, 	recall: 0.7770, 	specificity: 0.9958, 	f1: 0.8660, 	loss0.5734
+Train Epoch 22: 100%|██████████| 6137/6137 [09:15<00:00, 11.04it/s, loss=0.103]
+Train Epoch 22 ==> 	accuracy: 0.8654, 	precision: 0.9993, 	recall: 0.7314, 	specificity: 0.9995, 	f1: 0.8446,	 loss0.5689
+Test Epoch 22: 100%|██████████| 1748/1748 [01:00<00:00, 29.03it/s, loss=0.129]
+Test Epoch 22 ==> 	accuracy: 0.9579, 	precision: 0.9816, 	recall: 0.7994, 	specificity: 0.9964, 	f1: 0.8812, 	loss0.6016
+Train Epoch 23: 100%|██████████| 6137/6137 [09:23<00:00, 10.89it/s, loss=0.162]
+Train Epoch 23 ==> 	accuracy: 0.8648, 	precision: 0.9993, 	recall: 0.7301, 	specificity: 0.9995, 	f1: 0.8438,	 loss0.5671
+Test Epoch 23: 100%|██████████| 1748/1748 [00:58<00:00, 29.81it/s, loss=0.422]
+Test Epoch 23 ==> 	accuracy: 0.9499, 	precision: 0.9815, 	recall: 0.7575, 	specificity: 0.9965, 	f1: 0.8551, 	loss0.5694
+Train Epoch 24: 100%|██████████| 6137/6137 [09:23<00:00, 10.89it/s, loss=0.114]
+Train Epoch 24 ==> 	accuracy: 0.8668, 	precision: 0.9994, 	recall: 0.7340, 	specificity: 0.9995, 	f1: 0.8464,	 loss0.5623
+Test Epoch 24: 100%|██████████| 1748/1748 [01:02<00:00, 27.79it/s, loss=0.126]
+Test Epoch 24 ==> 	accuracy: 0.9513, 	precision: 0.9907, 	recall: 0.7574, 	specificity: 0.9983, 	f1: 0.8585, 	loss0.3779
+Train Epoch 25: 100%|██████████| 6137/6137 [09:36<00:00, 10.65it/s, loss=0.0908]
+Train Epoch 25 ==> 	accuracy: 0.8683, 	precision: 0.9994, 	recall: 0.7371, 	specificity: 0.9996, 	f1: 0.8484,	 loss0.5554
+Test Epoch 25: 100%|██████████| 1748/1748 [01:02<00:00, 27.95it/s, loss=0.396]
+Test Epoch 25 ==> 	accuracy: 0.9556, 	precision: 0.9727, 	recall: 0.7949, 	specificity: 0.9946, 	f1: 0.8748, 	loss0.7773
+Train Epoch 26: 100%|██████████| 6137/6137 [09:29<00:00, 10.78it/s, loss=0.144]
+Train Epoch 26 ==> 	accuracy: 0.8688, 	precision: 0.9994, 	recall: 0.7380, 	specificity: 0.9996, 	f1: 0.8490,	 loss0.5542
+Test Epoch 26: 100%|██████████| 1748/1748 [01:01<00:00, 28.66it/s, loss=0.107]
+Test Epoch 26 ==> 	accuracy: 0.9518, 	precision: 0.9896, 	recall: 0.7610, 	specificity: 0.9981, 	f1: 0.8603, 	loss0.4612
+Train Epoch 27: 100%|██████████| 6137/6137 [09:26<00:00, 10.83it/s, loss=0.102]
+Train Epoch 27 ==> 	accuracy: 0.8698, 	precision: 0.9994, 	recall: 0.7400, 	specificity: 0.9996, 	f1: 0.8504,	 loss0.5485
+Test Epoch 27: 100%|██████████| 1748/1748 [01:00<00:00, 28.97it/s, loss=0.0721]
+Test Epoch 27 ==> 	accuracy: 0.9542, 	precision: 0.9814, 	recall: 0.7800, 	specificity: 0.9964, 	f1: 0.8692, 	loss0.5809
+Train Epoch 28: 100%|██████████| 6137/6137 [09:23<00:00, 10.89it/s, loss=0.0175]
+Train Epoch 28 ==> 	accuracy: 0.8701, 	precision: 0.9994, 	recall: 0.7407, 	specificity: 0.9996, 	f1: 0.8508,	 loss0.5550
+Test Epoch 28: 100%|██████████| 1748/1748 [00:54<00:00, 32.34it/s, loss=0.105]
+Test Epoch 28 ==> 	accuracy: 0.9525, 	precision: 0.9827, 	recall: 0.7701, 	specificity: 0.9967, 	f1: 0.8635, 	loss0.5098
+Train Epoch 29: 100%|██████████| 6137/6137 [08:58<00:00, 11.39it/s, loss=0.0029]
+Train Epoch 29 ==> 	accuracy: 0.8752, 	precision: 0.9994, 	recall: 0.7508, 	specificity: 0.9995, 	f1: 0.8574,	 loss0.5357
+Test Epoch 29: 100%|██████████| 1748/1748 [00:55<00:00, 31.54it/s, loss=0.191]
+Test Epoch 29 ==> 	accuracy: 0.9576, 	precision: 0.9760, 	recall: 0.8026, 	specificity: 0.9952, 	f1: 0.8808, 	loss0.6962
+Train Epoch 30: 100%|██████████| 6137/6137 [09:12<00:00, 11.11it/s, loss=0.396]
+Train Epoch 30 ==> 	accuracy: 0.8718, 	precision: 0.9994, 	recall: 0.7440, 	specificity: 0.9996, 	f1: 0.8530,	 loss0.5546
+Test Epoch 30: 100%|██████████| 1748/1748 [00:52<00:00, 33.12it/s, loss=0.172]
+Test Epoch 30 ==> 	accuracy: 0.9542, 	precision: 0.9761, 	recall: 0.7845, 	specificity: 0.9953, 	f1: 0.8699, 	loss0.5786
+Train Epoch 31: 100%|██████████| 6137/6137 [09:13<00:00, 11.08it/s, loss=0.0888]
+Train Epoch 31 ==> 	accuracy: 0.8777, 	precision: 0.9994, 	recall: 0.7559, 	specificity: 0.9996, 	f1: 0.8608,	 loss0.5241
+Test Epoch 31: 100%|██████████| 1748/1748 [00:55<00:00, 31.45it/s, loss=0.303]
+Test Epoch 31 ==> 	accuracy: 0.9508, 	precision: 0.9812, 	recall: 0.7625, 	specificity: 0.9965, 	f1: 0.8581, 	loss0.5884
+Train Epoch 32: 100%|██████████| 6137/6137 [08:49<00:00, 11.58it/s, loss=0.0421]
+Train Epoch 32 ==> 	accuracy: 0.8740, 	precision: 0.9994, 	recall: 0.7485, 	specificity: 0.9996, 	f1: 0.8559,	 loss0.5480
+Test Epoch 32: 100%|██████████| 1748/1748 [00:58<00:00, 29.91it/s, loss=0.117]
+Test Epoch 32 ==> 	accuracy: 0.9588, 	precision: 0.9866, 	recall: 0.7997, 	specificity: 0.9974, 	f1: 0.8834, 	loss0.4618
+Train Epoch 33: 100%|██████████| 6137/6137 [08:58<00:00, 11.39it/s, loss=0.134]
+Train Epoch 33 ==> 	accuracy: 0.8779, 	precision: 0.9994, 	recall: 0.7562, 	specificity: 0.9996, 	f1: 0.8610,	 loss0.5299
+Test Epoch 33: 100%|██████████| 1748/1748 [00:56<00:00, 31.02it/s, loss=0.134]
+Test Epoch 33 ==> 	accuracy: 0.9601, 	precision: 0.9804, 	recall: 0.8117, 	specificity: 0.9961, 	f1: 0.8881, 	loss0.5749
+Train Epoch 34: 100%|██████████| 6137/6137 [08:55<00:00, 11.47it/s, loss=0.0169]
+Train Epoch 34 ==> 	accuracy: 0.8783, 	precision: 0.9994, 	recall: 0.7570, 	specificity: 0.9995, 	f1: 0.8615,	 loss0.5439
+Test Epoch 34: 100%|██████████| 1748/1748 [00:58<00:00, 29.91it/s, loss=0.101]
+Test Epoch 34 ==> 	accuracy: 0.9578, 	precision: 0.9757, 	recall: 0.8040, 	specificity: 0.9951, 	f1: 0.8816, 	loss0.6393
+Train Epoch 35: 100%|██████████| 6137/6137 [08:49<00:00, 11.60it/s, loss=0.121]
+Train Epoch 35 ==> 	accuracy: 0.8786, 	precision: 0.9995, 	recall: 0.7577, 	specificity: 0.9996, 	f1: 0.8619,	 loss0.5238
+Test Epoch 35: 100%|██████████| 1748/1748 [00:53<00:00, 32.75it/s, loss=0.11]
+Test Epoch 35 ==> 	accuracy: 0.9545, 	precision: 0.9902, 	recall: 0.7747, 	specificity: 0.9981, 	f1: 0.8693, 	loss0.3717
+Train Epoch 36: 100%|██████████| 6137/6137 [09:03<00:00, 11.29it/s, loss=0.0876]
+Train Epoch 36 ==> 	accuracy: 0.8783, 	precision: 0.9995, 	recall: 0.7570, 	specificity: 0.9996, 	f1: 0.8615,	 loss0.5309
+Test Epoch 36: 100%|██████████| 1748/1748 [01:00<00:00, 28.76it/s, loss=0.164]
+Test Epoch 36 ==> 	accuracy: 0.9557, 	precision: 0.9881, 	recall: 0.7822, 	specificity: 0.9977, 	f1: 0.8732, 	loss0.4561
+Train Epoch 37: 100%|██████████| 6137/6137 [08:51<00:00, 11.55it/s, loss=0.0939]
+Train Epoch 37 ==> 	accuracy: 0.8802, 	precision: 0.9994, 	recall: 0.7608, 	specificity: 0.9996, 	f1: 0.8639,	 loss0.5285
+Test Epoch 37: 100%|██████████| 1748/1748 [00:52<00:00, 33.35it/s, loss=0.164]
+Test Epoch 37 ==> 	accuracy: 0.9552, 	precision: 0.9826, 	recall: 0.7843, 	specificity: 0.9966, 	f1: 0.8723, 	loss0.5629
+Train Epoch 38: 100%|██████████| 6137/6137 [08:46<00:00, 11.66it/s, loss=0.111]
+Train Epoch 38 ==> 	accuracy: 0.8790, 	precision: 0.9995, 	recall: 0.7585, 	specificity: 0.9996, 	f1: 0.8624,	 loss0.5283
+Test Epoch 38: 100%|██████████| 1748/1748 [01:00<00:00, 28.94it/s, loss=0.299]
+Test Epoch 38 ==> 	accuracy: 0.9562, 	precision: 0.9855, 	recall: 0.7869, 	specificity: 0.9972, 	f1: 0.8751, 	loss0.4928
+Train Epoch 39: 100%|██████████| 6137/6137 [09:11<00:00, 11.13it/s, loss=0.0142]
+Train Epoch 39 ==> 	accuracy: 0.8822, 	precision: 0.9995, 	recall: 0.7649, 	specificity: 0.9996, 	f1: 0.8666,	 loss0.5167
+Test Epoch 39: 100%|██████████| 1748/1748 [01:00<00:00, 28.87it/s, loss=0.132]
+Test Epoch 39 ==> 	accuracy: 0.9600, 	precision: 0.9700, 	recall: 0.8205, 	specificity: 0.9939, 	f1: 0.8890, 	loss0.7784
+Train Epoch 40: 100%|██████████| 6137/6137 [09:11<00:00, 11.12it/s, loss=0.0364]
+Train Epoch 40 ==> 	accuracy: 0.8825, 	precision: 0.9995, 	recall: 0.7654, 	specificity: 0.9996, 	f1: 0.8669,	 loss0.3032
+Test Epoch 40: 100%|██████████| 1748/1748 [00:58<00:00, 29.66it/s, loss=0.276]
+Test Epoch 40 ==> 	accuracy: 0.9564, 	precision: 0.9797, 	recall: 0.7931, 	specificity: 0.9960, 	f1: 0.8766, 	loss0.5825
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 41: 100%|██████████| 6137/6137 [09:04<00:00, 11.28it/s, loss=0.0081]
+Train Epoch 41 ==> 	accuracy: 0.8808, 	precision: 0.9994, 	recall: 0.7621, 	specificity: 0.9996, 	f1: 0.8648,	 loss0.3103
+Test Epoch 41: 100%|██████████| 1748/1748 [01:05<00:00, 26.89it/s, loss=0.67]
+Test Epoch 41 ==> 	accuracy: 0.9574, 	precision: 0.9825, 	recall: 0.7957, 	specificity: 0.9966, 	f1: 0.8793, 	loss0.4837
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 42: 100%|██████████| 6137/6137 [08:56<00:00, 11.43it/s, loss=0.0132]
+Train Epoch 42 ==> 	accuracy: 0.8835, 	precision: 0.9995, 	recall: 0.7673, 	specificity: 0.9996, 	f1: 0.8681,	 loss0.2994
+Test Epoch 42: 100%|██████████| 1748/1748 [00:57<00:00, 30.50it/s, loss=0.162]
+Test Epoch 42 ==> 	accuracy: 0.9613, 	precision: 0.9835, 	recall: 0.8154, 	specificity: 0.9967, 	f1: 0.8916, 	loss0.4833
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 43: 100%|██████████| 6137/6137 [08:47<00:00, 11.64it/s, loss=0.0156]
+Train Epoch 43 ==> 	accuracy: 0.8838, 	precision: 0.9995, 	recall: 0.7680, 	specificity: 0.9996, 	f1: 0.8686,	 loss0.2968
+Test Epoch 43: 100%|██████████| 1748/1748 [00:56<00:00, 30.89it/s, loss=0.25]
+Test Epoch 43 ==> 	accuracy: 0.9571, 	precision: 0.9846, 	recall: 0.7924, 	specificity: 0.9970, 	f1: 0.8781, 	loss0.5796
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 44: 100%|██████████| 6137/6137 [08:47<00:00, 11.64it/s, loss=0.0095]
+Train Epoch 44 ==> 	accuracy: 0.8859, 	precision: 0.9995, 	recall: 0.7722, 	specificity: 0.9996, 	f1: 0.8713,	 loss0.2882
+Test Epoch 44: 100%|██████████| 1748/1748 [00:57<00:00, 30.66it/s, loss=0.324]
+Test Epoch 44 ==> 	accuracy: 0.9608, 	precision: 0.9824, 	recall: 0.8136, 	specificity: 0.9965, 	f1: 0.8901, 	loss0.5677
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 45: 100%|██████████| 6137/6137 [08:35<00:00, 11.90it/s, loss=0.0053]
+Train Epoch 45 ==> 	accuracy: 0.8858, 	precision: 0.9995, 	recall: 0.7720, 	specificity: 0.9996, 	f1: 0.8712,	 loss0.2986
+Test Epoch 45: 100%|██████████| 1748/1748 [00:58<00:00, 29.72it/s, loss=0.294]
+Test Epoch 45 ==> 	accuracy: 0.9568, 	precision: 0.9761, 	recall: 0.7979, 	specificity: 0.9953, 	f1: 0.8780, 	loss0.7493
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 46: 100%|██████████| 6137/6137 [08:40<00:00, 11.79it/s, loss=0.006]
+Train Epoch 46 ==> 	accuracy: 0.8863, 	precision: 0.9996, 	recall: 0.7729, 	specificity: 0.9997, 	f1: 0.8718,	 loss0.2856
+Test Epoch 46: 100%|██████████| 1748/1748 [00:58<00:00, 29.84it/s, loss=0.0711]
+Test Epoch 46 ==> 	accuracy: 0.9603, 	precision: 0.9731, 	recall: 0.8192, 	specificity: 0.9945, 	f1: 0.8895, 	loss1.0306
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 47: 100%|██████████| 6137/6137 [08:59<00:00, 11.38it/s, loss=0.0333]
+Train Epoch 47 ==> 	accuracy: 0.8862, 	precision: 0.9995, 	recall: 0.7728, 	specificity: 0.9996, 	f1: 0.8717,	 loss0.2939
+Test Epoch 47: 100%|██████████| 1748/1748 [01:00<00:00, 28.68it/s, loss=0.354]
+Test Epoch 47 ==> 	accuracy: 0.9614, 	precision: 0.9879, 	recall: 0.8120, 	specificity: 0.9976, 	f1: 0.8914, 	loss0.4972
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 48: 100%|██████████| 6137/6137 [08:45<00:00, 11.68it/s, loss=0.0127]
+Train Epoch 48 ==> 	accuracy: 0.8916, 	precision: 0.9995, 	recall: 0.7836, 	specificity: 0.9996, 	f1: 0.8785,	 loss0.2797
+Test Epoch 48: 100%|██████████| 1748/1748 [00:58<00:00, 29.80it/s, loss=0.0965]
+Test Epoch 48 ==> 	accuracy: 0.9605, 	precision: 0.9860, 	recall: 0.8093, 	specificity: 0.9972, 	f1: 0.8890, 	loss0.6218
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 49: 100%|██████████| 6137/6137 [08:48<00:00, 11.62it/s, loss=0.0177]
+Train Epoch 49 ==> 	accuracy: 0.8879, 	precision: 0.9996, 	recall: 0.7762, 	specificity: 0.9997, 	f1: 0.8738,	 loss0.2955
+Test Epoch 49: 100%|██████████| 1748/1748 [00:53<00:00, 32.74it/s, loss=0.0724]
+Test Epoch 49 ==> 	accuracy: 0.9612, 	precision: 0.9886, 	recall: 0.8106, 	specificity: 0.9977, 	f1: 0.8908, 	loss0.4386
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 50: 100%|██████████| 6137/6137 [08:36<00:00, 11.89it/s, loss=0.0298]
+Train Epoch 50 ==> 	accuracy: 0.8912, 	precision: 0.9996, 	recall: 0.7828, 	specificity: 0.9997, 	f1: 0.8780,	 loss0.2738
+Test Epoch 50: 100%|██████████| 1748/1748 [00:56<00:00, 30.89it/s, loss=0.0516]
+Test Epoch 50 ==> 	accuracy: 0.9620, 	precision: 0.9859, 	recall: 0.8170, 	specificity: 0.9972, 	f1: 0.8935, 	loss0.5688
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 51: 100%|██████████| 6137/6137 [08:29<00:00, 12.04it/s, loss=0.0409]
+Train Epoch 51 ==> 	accuracy: 0.8903, 	precision: 0.9996, 	recall: 0.7808, 	specificity: 0.9997, 	f1: 0.8768,	 loss0.2888
+Test Epoch 51: 100%|██████████| 1748/1748 [00:53<00:00, 32.78it/s, loss=0.704]
+Test Epoch 51 ==> 	accuracy: 0.9633, 	precision: 0.9877, 	recall: 0.8220, 	specificity: 0.9975, 	f1: 0.8973, 	loss0.4904
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 52: 100%|██████████| 6137/6137 [08:29<00:00, 12.04it/s, loss=0.0126]
+Train Epoch 52 ==> 	accuracy: 0.8956, 	precision: 0.9996, 	recall: 0.7916, 	specificity: 0.9997, 	f1: 0.8835,	 loss0.2688
+Test Epoch 52: 100%|██████████| 1748/1748 [00:51<00:00, 34.23it/s, loss=0.236]
+Test Epoch 52 ==> 	accuracy: 0.9624, 	precision: 0.9815, 	recall: 0.8229, 	specificity: 0.9962, 	f1: 0.8952, 	loss0.6892
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 53: 100%|██████████| 6137/6137 [08:33<00:00, 11.96it/s, loss=0.0223]
+Train Epoch 53 ==> 	accuracy: 0.8944, 	precision: 0.9996, 	recall: 0.7891, 	specificity: 0.9997, 	f1: 0.8820,	 loss0.2786
+Test Epoch 53: 100%|██████████| 1748/1748 [00:53<00:00, 32.87it/s, loss=0.0718]
+Test Epoch 53 ==> 	accuracy: 0.9634, 	precision: 0.9866, 	recall: 0.8234, 	specificity: 0.9973, 	f1: 0.8977, 	loss0.4568
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 54: 100%|██████████| 6137/6137 [08:31<00:00, 12.01it/s, loss=0.0046]
+Train Epoch 54 ==> 	accuracy: 0.8953, 	precision: 0.9996, 	recall: 0.7910, 	specificity: 0.9997, 	f1: 0.8831,	 loss0.2723
+Test Epoch 54: 100%|██████████| 1748/1748 [00:55<00:00, 31.59it/s, loss=0.562]
+Test Epoch 54 ==> 	accuracy: 0.9624, 	precision: 0.9799, 	recall: 0.8242, 	specificity: 0.9959, 	f1: 0.8953, 	loss0.6560
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 55: 100%|██████████| 6137/6137 [08:12<00:00, 12.46it/s, loss=0.0125]
+Train Epoch 55 ==> 	accuracy: 0.8962, 	precision: 0.9996, 	recall: 0.7927, 	specificity: 0.9997, 	f1: 0.8842,	 loss0.2701
+Test Epoch 55: 100%|██████████| 1748/1748 [00:57<00:00, 30.65it/s, loss=0.564]
+Test Epoch 55 ==> 	accuracy: 0.9622, 	precision: 0.9888, 	recall: 0.8153, 	specificity: 0.9978, 	f1: 0.8937, 	loss0.4138
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 56: 100%|██████████| 6137/6137 [08:37<00:00, 11.86it/s, loss=0.0322]
+Train Epoch 56 ==> 	accuracy: 0.8985, 	precision: 0.9996, 	recall: 0.7974, 	specificity: 0.9997, 	f1: 0.8871,	 loss0.2701
+Test Epoch 56: 100%|██████████| 1748/1748 [00:52<00:00, 33.60it/s, loss=0.0514]
+Test Epoch 56 ==> 	accuracy: 0.9627, 	precision: 0.9868, 	recall: 0.8196, 	specificity: 0.9973, 	f1: 0.8955, 	loss0.4787
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 57: 100%|██████████| 6137/6137 [08:26<00:00, 12.11it/s, loss=0.0172]
+Train Epoch 57 ==> 	accuracy: 0.8986, 	precision: 0.9996, 	recall: 0.7975, 	specificity: 0.9997, 	f1: 0.8872,	 loss0.2628
+Test Epoch 57: 100%|██████████| 1748/1748 [00:56<00:00, 30.74it/s, loss=0.135]
+Test Epoch 57 ==> 	accuracy: 0.9628, 	precision: 0.9848, 	recall: 0.8222, 	specificity: 0.9969, 	f1: 0.8962, 	loss0.5306
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 58: 100%|██████████| 6137/6137 [08:42<00:00, 11.74it/s, loss=0.0216]
+Train Epoch 58 ==> 	accuracy: 0.8984, 	precision: 0.9996, 	recall: 0.7972, 	specificity: 0.9997, 	f1: 0.8870,	 loss0.2692
+Test Epoch 58: 100%|██████████| 1748/1748 [00:56<00:00, 31.01it/s, loss=0.105]
+Test Epoch 58 ==> 	accuracy: 0.9633, 	precision: 0.9791, 	recall: 0.8294, 	specificity: 0.9957, 	f1: 0.8981, 	loss0.7355
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 59: 100%|██████████| 6137/6137 [08:27<00:00, 12.10it/s, loss=0.0026]
+Train Epoch 59 ==> 	accuracy: 0.9010, 	precision: 0.9996, 	recall: 0.8024, 	specificity: 0.9997, 	f1: 0.8902,	 loss0.2630
+Test Epoch 59: 100%|██████████| 1748/1748 [00:56<00:00, 30.72it/s, loss=0.353]
+Test Epoch 59 ==> 	accuracy: 0.9648, 	precision: 0.9834, 	recall: 0.8337, 	specificity: 0.9966, 	f1: 0.9024, 	loss0.6198
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 60: 100%|██████████| 6137/6137 [08:40<00:00, 11.79it/s, loss=0.0228]
+Train Epoch 60 ==> 	accuracy: 0.9022, 	precision: 0.9996, 	recall: 0.8048, 	specificity: 0.9997, 	f1: 0.8917,	 loss0.2614
+Test Epoch 60: 100%|██████████| 1748/1748 [00:55<00:00, 31.66it/s, loss=0.392]
+Test Epoch 60 ==> 	accuracy: 0.9629, 	precision: 0.9847, 	recall: 0.8227, 	specificity: 0.9969, 	f1: 0.8965, 	loss0.5573
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 61: 100%|██████████| 6137/6137 [08:58<00:00, 11.40it/s, loss=0.0149]
+Train Epoch 61 ==> 	accuracy: 0.9036, 	precision: 0.9997, 	recall: 0.8074, 	specificity: 0.9997, 	f1: 0.8933,	 loss0.2554
+Test Epoch 61: 100%|██████████| 1748/1748 [00:59<00:00, 29.50it/s, loss=0.0402]
+Test Epoch 61 ==> 	accuracy: 0.9630, 	precision: 0.9842, 	recall: 0.8238, 	specificity: 0.9968, 	f1: 0.8969, 	loss0.5518
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 62: 100%|██████████| 6137/6137 [08:58<00:00, 11.39it/s, loss=0.0123]
+Train Epoch 62 ==> 	accuracy: 0.9004, 	precision: 0.9997, 	recall: 0.8010, 	specificity: 0.9997, 	f1: 0.8894,	 loss0.2578
+Test Epoch 62: 100%|██████████| 1748/1748 [00:54<00:00, 31.91it/s, loss=0.576]
+Test Epoch 62 ==> 	accuracy: 0.9648, 	precision: 0.9811, 	recall: 0.8357, 	specificity: 0.9961, 	f1: 0.9026, 	loss0.7871
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 63: 100%|██████████| 6137/6137 [08:59<00:00, 11.38it/s, loss=0.0084]
+Train Epoch 63 ==> 	accuracy: 0.9034, 	precision: 0.9997, 	recall: 0.8071, 	specificity: 0.9997, 	f1: 0.8931,	 loss0.2537
+Test Epoch 63: 100%|██████████| 1748/1748 [01:03<00:00, 27.44it/s, loss=0.293]
+Test Epoch 63 ==> 	accuracy: 0.9632, 	precision: 0.9805, 	recall: 0.8279, 	specificity: 0.9960, 	f1: 0.8978, 	loss0.7459
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 64: 100%|██████████| 6137/6137 [09:04<00:00, 11.26it/s, loss=0.0043]
+Train Epoch 64 ==> 	accuracy: 0.9037, 	precision: 0.9997, 	recall: 0.8077, 	specificity: 0.9997, 	f1: 0.8935,	 loss0.2554
+Test Epoch 64: 100%|██████████| 1748/1748 [01:03<00:00, 27.73it/s, loss=0.0841]
+Test Epoch 64 ==> 	accuracy: 0.9652, 	precision: 0.9819, 	recall: 0.8371, 	specificity: 0.9963, 	f1: 0.9037, 	loss0.7662
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 65: 100%|██████████| 6137/6137 [09:09<00:00, 11.17it/s, loss=0.0087]
+Train Epoch 65 ==> 	accuracy: 0.9047, 	precision: 0.9997, 	recall: 0.8096, 	specificity: 0.9997, 	f1: 0.8947,	 loss0.2496
+Test Epoch 65: 100%|██████████| 1748/1748 [01:01<00:00, 28.31it/s, loss=0.793]
+Test Epoch 65 ==> 	accuracy: 0.9646, 	precision: 0.9833, 	recall: 0.8327, 	specificity: 0.9966, 	f1: 0.9017, 	loss0.5821
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 66: 100%|██████████| 6137/6137 [09:27<00:00, 10.81it/s, loss=0.0233]
+Train Epoch 66 ==> 	accuracy: 0.9052, 	precision: 0.9997, 	recall: 0.8106, 	specificity: 0.9997, 	f1: 0.8953,	 loss0.2533
+Test Epoch 66: 100%|██████████| 1748/1748 [00:59<00:00, 29.44it/s, loss=0.128]
+Test Epoch 66 ==> 	accuracy: 0.9636, 	precision: 0.9876, 	recall: 0.8237, 	specificity: 0.9975, 	f1: 0.8982, 	loss0.5184
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 67: 100%|██████████| 6137/6137 [09:19<00:00, 10.97it/s, loss=0.0228]
+Train Epoch 67 ==> 	accuracy: 0.9062, 	precision: 0.9997, 	recall: 0.8127, 	specificity: 0.9997, 	f1: 0.8965,	 loss0.2488
+Test Epoch 67: 100%|██████████| 1748/1748 [01:07<00:00, 25.98it/s, loss=1.35]
+Test Epoch 67 ==> 	accuracy: 0.9652, 	precision: 0.9831, 	recall: 0.8361, 	specificity: 0.9965, 	f1: 0.9036, 	loss0.5698
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 68: 100%|██████████| 6137/6137 [09:14<00:00, 11.07it/s, loss=0.003]
+Train Epoch 68 ==> 	accuracy: 0.9095, 	precision: 0.9996, 	recall: 0.8193, 	specificity: 0.9997, 	f1: 0.9005,	 loss0.2430
+Test Epoch 68: 100%|██████████| 1748/1748 [00:59<00:00, 29.46it/s, loss=0.0771]
+Test Epoch 68 ==> 	accuracy: 0.9658, 	precision: 0.9836, 	recall: 0.8385, 	specificity: 0.9966, 	f1: 0.9053, 	loss0.7213
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 69: 100%|██████████| 6137/6137 [09:21<00:00, 10.93it/s, loss=0.0139]
+Train Epoch 69 ==> 	accuracy: 0.9084, 	precision: 0.9997, 	recall: 0.8170, 	specificity: 0.9998, 	f1: 0.8992,	 loss0.2438
+Test Epoch 69: 100%|██████████| 1748/1748 [01:02<00:00, 28.08it/s, loss=1.32]
+Test Epoch 69 ==> 	accuracy: 0.9663, 	precision: 0.9791, 	recall: 0.8453, 	specificity: 0.9956, 	f1: 0.9073, 	loss0.9222
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 70: 100%|██████████| 6137/6137 [09:25<00:00, 10.85it/s, loss=0.0023]
+Train Epoch 70 ==> 	accuracy: 0.9096, 	precision: 0.9997, 	recall: 0.8194, 	specificity: 0.9997, 	f1: 0.9006,	 loss0.2433
+Test Epoch 70: 100%|██████████| 1748/1748 [01:01<00:00, 28.29it/s, loss=0.24]
+Test Epoch 70 ==> 	accuracy: 0.9664, 	precision: 0.9832, 	recall: 0.8422, 	specificity: 0.9965, 	f1: 0.9073, 	loss0.6328
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 71: 100%|██████████| 6137/6137 [09:21<00:00, 10.93it/s, loss=0.0202]
+Train Epoch 71 ==> 	accuracy: 0.9079, 	precision: 0.9997, 	recall: 0.8160, 	specificity: 0.9997, 	f1: 0.8986,	 loss0.2470
+Test Epoch 71: 100%|██████████| 1748/1748 [01:02<00:00, 28.08it/s, loss=0.233]
+Test Epoch 71 ==> 	accuracy: 0.9653, 	precision: 0.9795, 	recall: 0.8398, 	specificity: 0.9957, 	f1: 0.9043, 	loss0.7833
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 72: 100%|██████████| 6137/6137 [09:27<00:00, 10.82it/s, loss=0.0248]
+Train Epoch 72 ==> 	accuracy: 0.9118, 	precision: 0.9997, 	recall: 0.8238, 	specificity: 0.9997, 	f1: 0.9032,	 loss0.2361
+Test Epoch 72: 100%|██████████| 1748/1748 [01:03<00:00, 27.55it/s, loss=0.354]
+Test Epoch 72 ==> 	accuracy: 0.9678, 	precision: 0.9829, 	recall: 0.8500, 	specificity: 0.9964, 	f1: 0.9116, 	loss0.6797
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 73: 100%|██████████| 6137/6137 [09:29<00:00, 10.79it/s, loss=0.0114]
+Train Epoch 73 ==> 	accuracy: 0.9093, 	precision: 0.9997, 	recall: 0.8188, 	specificity: 0.9997, 	f1: 0.9002,	 loss0.2418
+Test Epoch 73: 100%|██████████| 1748/1748 [01:05<00:00, 26.69it/s, loss=1.24]
+Test Epoch 73 ==> 	accuracy: 0.9667, 	precision: 0.9829, 	recall: 0.8442, 	specificity: 0.9964, 	f1: 0.9083, 	loss0.7135
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 74: 100%|██████████| 6137/6137 [09:34<00:00, 10.68it/s, loss=0.0243]
+Train Epoch 74 ==> 	accuracy: 0.9131, 	precision: 0.9997, 	recall: 0.8264, 	specificity: 0.9997, 	f1: 0.9048,	 loss0.2321
+Test Epoch 74: 100%|██████████| 1748/1748 [01:02<00:00, 27.78it/s, loss=0.0916]
+Test Epoch 74 ==> 	accuracy: 0.9683, 	precision: 0.9834, 	recall: 0.8520, 	specificity: 0.9965, 	f1: 0.9130, 	loss0.6795
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 75: 100%|██████████| 6137/6137 [09:24<00:00, 10.88it/s, loss=0.279]
+Train Epoch 75 ==> 	accuracy: 0.9111, 	precision: 0.9997, 	recall: 0.8224, 	specificity: 0.9997, 	f1: 0.9024,	 loss0.2409
+Test Epoch 75: 100%|██████████| 1748/1748 [01:00<00:00, 29.06it/s, loss=1.67]
+Test Epoch 75 ==> 	accuracy: 0.9677, 	precision: 0.9801, 	recall: 0.8516, 	specificity: 0.9958, 	f1: 0.9113, 	loss0.7409
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 76: 100%|██████████| 6137/6137 [08:59<00:00, 11.37it/s, loss=0.0009]
+Train Epoch 76 ==> 	accuracy: 0.9142, 	precision: 0.9997, 	recall: 0.8287, 	specificity: 0.9998, 	f1: 0.9062,	 loss0.2297
+Test Epoch 76: 100%|██████████| 1748/1748 [00:58<00:00, 29.80it/s, loss=0.056]
+Test Epoch 76 ==> 	accuracy: 0.9677, 	precision: 0.9817, 	recall: 0.8502, 	specificity: 0.9962, 	f1: 0.9112, 	loss0.7038
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 77: 100%|██████████| 6137/6137 [08:43<00:00, 11.71it/s, loss=0.0523]
+Train Epoch 77 ==> 	accuracy: 0.9139, 	precision: 0.9997, 	recall: 0.8282, 	specificity: 0.9997, 	f1: 0.9059,	 loss0.2329
+Test Epoch 77: 100%|██████████| 1748/1748 [00:58<00:00, 30.00it/s, loss=0.147]
+Test Epoch 77 ==> 	accuracy: 0.9676, 	precision: 0.9834, 	recall: 0.8484, 	specificity: 0.9965, 	f1: 0.9109, 	loss0.7581
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 78: 100%|██████████| 6137/6137 [08:43<00:00, 11.72it/s, loss=0.0148]
+Train Epoch 78 ==> 	accuracy: 0.9148, 	precision: 0.9997, 	recall: 0.8299, 	specificity: 0.9997, 	f1: 0.9069,	 loss0.2309
+Test Epoch 78: 100%|██████████| 1748/1748 [00:57<00:00, 30.40it/s, loss=0.292]
+Test Epoch 78 ==> 	accuracy: 0.9686, 	precision: 0.9792, 	recall: 0.8572, 	specificity: 0.9956, 	f1: 0.9142, 	loss0.8169
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 79: 100%|██████████| 6137/6137 [08:53<00:00, 11.51it/s, loss=0.0081]
+Train Epoch 79 ==> 	accuracy: 0.9144, 	precision: 0.9997, 	recall: 0.8291, 	specificity: 0.9997, 	f1: 0.9064,	 loss0.2298
+Test Epoch 79: 100%|██████████| 1748/1748 [01:02<00:00, 28.05it/s, loss=0.129]
+Test Epoch 79 ==> 	accuracy: 0.9670, 	precision: 0.9815, 	recall: 0.8470, 	specificity: 0.9961, 	f1: 0.9093, 	loss0.7153
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 80: 100%|██████████| 6137/6137 [09:10<00:00, 11.14it/s, loss=0.0023]
+Train Epoch 80 ==> 	accuracy: 0.9138, 	precision: 0.9997, 	recall: 0.8279, 	specificity: 0.9997, 	f1: 0.9057,	 loss0.2353
+Test Epoch 80: 100%|██████████| 1748/1748 [01:01<00:00, 28.47it/s, loss=0.497]
+Test Epoch 80 ==> 	accuracy: 0.9685, 	precision: 0.9807, 	recall: 0.8554, 	specificity: 0.9959, 	f1: 0.9137, 	loss0.7847
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 81: 100%|██████████| 6137/6137 [09:18<00:00, 10.99it/s, loss=0.0132]
+Train Epoch 81 ==> 	accuracy: 0.9178, 	precision: 0.9997, 	recall: 0.8358, 	specificity: 0.9997, 	f1: 0.9104,	 loss0.2210
+Test Epoch 81: 100%|██████████| 1748/1748 [01:04<00:00, 27.10it/s, loss=0.577]
+Test Epoch 81 ==> 	accuracy: 0.9679, 	precision: 0.9793, 	recall: 0.8534, 	specificity: 0.9956, 	f1: 0.9120, 	loss0.7433
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 82: 100%|██████████| 6137/6137 [09:20<00:00, 10.96it/s, loss=0.0134]
+Train Epoch 82 ==> 	accuracy: 0.9151, 	precision: 0.9997, 	recall: 0.8305, 	specificity: 0.9998, 	f1: 0.9073,	 loss0.2320
+Test Epoch 82: 100%|██████████| 1748/1748 [00:57<00:00, 30.67it/s, loss=0.16]
+Test Epoch 82 ==> 	accuracy: 0.9692, 	precision: 0.9807, 	recall: 0.8588, 	specificity: 0.9959, 	f1: 0.9157, 	loss0.8045
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 83: 100%|██████████| 6137/6137 [09:22<00:00, 10.92it/s, loss=0.0126]
+Train Epoch 83 ==> 	accuracy: 0.9164, 	precision: 0.9997, 	recall: 0.8330, 	specificity: 0.9998, 	f1: 0.9088,	 loss0.2232
+Test Epoch 83: 100%|██████████| 1748/1748 [01:02<00:00, 27.78it/s, loss=0.22]
+Test Epoch 83 ==> 	accuracy: 0.9696, 	precision: 0.9769, 	recall: 0.8645, 	specificity: 0.9951, 	f1: 0.9173, 	loss0.9704
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 84: 100%|██████████| 6137/6137 [09:17<00:00, 11.01it/s, loss=0.0118]
+Train Epoch 84 ==> 	accuracy: 0.9144, 	precision: 0.9997, 	recall: 0.8290, 	specificity: 0.9998, 	f1: 0.9064,	 loss0.2290
+Test Epoch 84: 100%|██████████| 1748/1748 [00:57<00:00, 30.41it/s, loss=0.604]
+Test Epoch 84 ==> 	accuracy: 0.9689, 	precision: 0.9793, 	recall: 0.8590, 	specificity: 0.9956, 	f1: 0.9152, 	loss0.8533
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 85: 100%|██████████| 6137/6137 [09:06<00:00, 11.24it/s, loss=0.0037]
+Train Epoch 85 ==> 	accuracy: 0.9202, 	precision: 0.9997, 	recall: 0.8406, 	specificity: 0.9998, 	f1: 0.9133,	 loss0.2157
+Test Epoch 85: 100%|██████████| 1748/1748 [00:57<00:00, 30.51it/s, loss=0.599]
+Test Epoch 85 ==> 	accuracy: 0.9685, 	precision: 0.9803, 	recall: 0.8560, 	specificity: 0.9958, 	f1: 0.9139, 	loss0.9457
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 86: 100%|██████████| 6137/6137 [09:27<00:00, 10.82it/s, loss=0.0465]
+Train Epoch 86 ==> 	accuracy: 0.9173, 	precision: 0.9997, 	recall: 0.8348, 	specificity: 0.9998, 	f1: 0.9099,	 loss0.2225
+Test Epoch 86: 100%|██████████| 1748/1748 [01:05<00:00, 26.88it/s, loss=0.193]
+Test Epoch 86 ==> 	accuracy: 0.9675, 	precision: 0.9839, 	recall: 0.8473, 	specificity: 0.9966, 	f1: 0.9105, 	loss0.7908
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 87: 100%|██████████| 6137/6137 [09:36<00:00, 10.65it/s, loss=0.0212]
+Train Epoch 87 ==> 	accuracy: 0.9186, 	precision: 0.9997, 	recall: 0.8375, 	specificity: 0.9998, 	f1: 0.9114,	 loss0.2194
+Test Epoch 87: 100%|██████████| 1748/1748 [01:06<00:00, 26.16it/s, loss=0.209]
+Test Epoch 87 ==> 	accuracy: 0.9683, 	precision: 0.9784, 	recall: 0.8564, 	specificity: 0.9954, 	f1: 0.9134, 	loss0.9059
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 88: 100%|██████████| 6137/6137 [09:46<00:00, 10.46it/s, loss=0.0157]
+Train Epoch 88 ==> 	accuracy: 0.9176, 	precision: 0.9997, 	recall: 0.8354, 	specificity: 0.9998, 	f1: 0.9102,	 loss0.2230
+Test Epoch 88: 100%|██████████| 1748/1748 [01:07<00:00, 25.93it/s, loss=0.107]
+Test Epoch 88 ==> 	accuracy: 0.9699, 	precision: 0.9773, 	recall: 0.8656, 	specificity: 0.9951, 	f1: 0.9181, 	loss0.9074
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 89: 100%|██████████| 6137/6137 [09:36<00:00, 10.64it/s, loss=0.0171]
+Train Epoch 89 ==> 	accuracy: 0.9216, 	precision: 0.9997, 	recall: 0.8434, 	specificity: 0.9997, 	f1: 0.9149,	 loss0.2140
+Test Epoch 89: 100%|██████████| 1748/1748 [01:03<00:00, 27.50it/s, loss=0.136]
+Test Epoch 89 ==> 	accuracy: 0.9699, 	precision: 0.9792, 	recall: 0.8639, 	specificity: 0.9956, 	f1: 0.9180, 	loss0.8202
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 90: 100%|██████████| 6137/6137 [09:30<00:00, 10.76it/s, loss=0.0191]
+Train Epoch 90 ==> 	accuracy: 0.9198, 	precision: 0.9997, 	recall: 0.8399, 	specificity: 0.9998, 	f1: 0.9128,	 loss0.2220
+Test Epoch 90: 100%|██████████| 1748/1748 [01:05<00:00, 26.71it/s, loss=0.371]
+Test Epoch 90 ==> 	accuracy: 0.9684, 	precision: 0.9852, 	recall: 0.8507, 	specificity: 0.9969, 	f1: 0.9130, 	loss0.6996
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 91: 100%|██████████| 6137/6137 [09:36<00:00, 10.65it/s, loss=0.0001]
+Train Epoch 91 ==> 	accuracy: 0.9191, 	precision: 0.9997, 	recall: 0.8385, 	specificity: 0.9998, 	f1: 0.9121,	 loss0.2156
+Test Epoch 91: 100%|██████████| 1748/1748 [01:04<00:00, 27.03it/s, loss=0.528]
+Test Epoch 91 ==> 	accuracy: 0.9684, 	precision: 0.9836, 	recall: 0.8521, 	specificity: 0.9965, 	f1: 0.9131, 	loss0.7428
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 92: 100%|██████████| 6137/6137 [09:36<00:00, 10.64it/s, loss=0.0004]
+Train Epoch 92 ==> 	accuracy: 0.9194, 	precision: 0.9997, 	recall: 0.8390, 	specificity: 0.9998, 	f1: 0.9123,	 loss0.2188
+Test Epoch 92: 100%|██████████| 1748/1748 [01:05<00:00, 26.55it/s, loss=0.169]
+Test Epoch 92 ==> 	accuracy: 0.9669, 	precision: 0.9840, 	recall: 0.8443, 	specificity: 0.9967, 	f1: 0.9088, 	loss0.7130
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 93: 100%|██████████| 6137/6137 [09:41<00:00, 10.55it/s, loss=0.0205]
+Train Epoch 93 ==> 	accuracy: 0.9217, 	precision: 0.9997, 	recall: 0.8436, 	specificity: 0.9998, 	f1: 0.9151,	 loss0.2100
+Test Epoch 93: 100%|██████████| 1748/1748 [01:05<00:00, 26.59it/s, loss=0.119]
+Test Epoch 93 ==> 	accuracy: 0.9695, 	precision: 0.9807, 	recall: 0.8607, 	specificity: 0.9959, 	f1: 0.9168, 	loss0.8054
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 94: 100%|██████████| 6137/6137 [09:40<00:00, 10.57it/s, loss=0.0092]
+Train Epoch 94 ==> 	accuracy: 0.9223, 	precision: 0.9997, 	recall: 0.8449, 	specificity: 0.9998, 	f1: 0.9158,	 loss0.2153
+Test Epoch 94: 100%|██████████| 1748/1748 [01:06<00:00, 26.36it/s, loss=0.216]
+Test Epoch 94 ==> 	accuracy: 0.9695, 	precision: 0.9779, 	recall: 0.8632, 	specificity: 0.9953, 	f1: 0.9170, 	loss0.8958
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 95: 100%|██████████| 6137/6137 [09:41<00:00, 10.56it/s, loss=0.0148]
+Train Epoch 95 ==> 	accuracy: 0.9213, 	precision: 0.9998, 	recall: 0.8429, 	specificity: 0.9998, 	f1: 0.9146,	 loss0.2137
+Test Epoch 95: 100%|██████████| 1748/1748 [01:06<00:00, 26.16it/s, loss=0.321]
+Test Epoch 95 ==> 	accuracy: 0.9691, 	precision: 0.9747, 	recall: 0.8640, 	specificity: 0.9946, 	f1: 0.9160, 	loss1.0198
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 96: 100%|██████████| 6137/6137 [09:36<00:00, 10.65it/s, loss=0.0123]
+Train Epoch 96 ==> 	accuracy: 0.9231, 	precision: 0.9997, 	recall: 0.8465, 	specificity: 0.9998, 	f1: 0.9168,	 loss0.2099
+Test Epoch 96: 100%|██████████| 1748/1748 [01:06<00:00, 26.41it/s, loss=0.126]
+Test Epoch 96 ==> 	accuracy: 0.9700, 	precision: 0.9799, 	recall: 0.8640, 	specificity: 0.9957, 	f1: 0.9183, 	loss0.9484
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 97: 100%|██████████| 6137/6137 [09:37<00:00, 10.63it/s, loss=0.0051]
+Train Epoch 97 ==> 	accuracy: 0.9224, 	precision: 0.9998, 	recall: 0.8450, 	specificity: 0.9998, 	f1: 0.9159,	 loss0.2130
+Test Epoch 97: 100%|██████████| 1748/1748 [01:08<00:00, 25.63it/s, loss=0.543]
+Test Epoch 97 ==> 	accuracy: 0.9706, 	precision: 0.9731, 	recall: 0.8732, 	specificity: 0.9942, 	f1: 0.9205, 	loss1.2265
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 98: 100%|██████████| 6137/6137 [09:43<00:00, 10.52it/s, loss=0.0061]
+Train Epoch 98 ==> 	accuracy: 0.9236, 	precision: 0.9997, 	recall: 0.8474, 	specificity: 0.9998, 	f1: 0.9173,	 loss0.2075
+Test Epoch 98: 100%|██████████| 1748/1748 [01:06<00:00, 26.19it/s, loss=0.129]
+Test Epoch 98 ==> 	accuracy: 0.9703, 	precision: 0.9780, 	recall: 0.8673, 	specificity: 0.9953, 	f1: 0.9193, 	loss1.0684
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 99: 100%|██████████| 6137/6137 [09:34<00:00, 10.68it/s, loss=0.0105]
+Train Epoch 99 ==> 	accuracy: 0.9212, 	precision: 0.9997, 	recall: 0.8426, 	specificity: 0.9998, 	f1: 0.9145,	 loss0.2174
+Test Epoch 99: 100%|██████████| 1748/1748 [01:00<00:00, 28.69it/s, loss=0.217]
+Test Epoch 99 ==> 	accuracy: 0.9701, 	precision: 0.9814, 	recall: 0.8633, 	specificity: 0.9960, 	f1: 0.9186, 	loss0.8219
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 100: 100%|██████████| 6137/6137 [09:29<00:00, 10.77it/s, loss=0.0178]
+Train Epoch 100 ==> 	accuracy: 0.9244, 	precision: 0.9997, 	recall: 0.8491, 	specificity: 0.9998, 	f1: 0.9183,	 loss0.2043
+Test Epoch 100: 100%|██████████| 1748/1748 [01:05<00:00, 26.85it/s, loss=0.0212]
+Test Epoch 100 ==> 	accuracy: 0.9705, 	precision: 0.9763, 	recall: 0.8697, 	specificity: 0.9949, 	f1: 0.9199, 	loss1.0403
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 101: 100%|██████████| 6137/6137 [09:33<00:00, 10.70it/s, loss=0.0005]
+Train Epoch 101 ==> 	accuracy: 0.9233, 	precision: 0.9998, 	recall: 0.8468, 	specificity: 0.9998, 	f1: 0.9169,	 loss0.2125
+Test Epoch 101: 100%|██████████| 1748/1748 [01:02<00:00, 28.09it/s, loss=0.371]
+Test Epoch 101 ==> 	accuracy: 0.9705, 	precision: 0.9810, 	recall: 0.8656, 	specificity: 0.9959, 	f1: 0.9196, 	loss0.8432
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 102: 100%|██████████| 6137/6137 [09:12<00:00, 11.11it/s, loss=0.0222]
+Train Epoch 102 ==> 	accuracy: 0.9239, 	precision: 0.9997, 	recall: 0.8480, 	specificity: 0.9998, 	f1: 0.9176,	 loss0.2071
+Test Epoch 102: 100%|██████████| 1748/1748 [00:59<00:00, 29.56it/s, loss=0.406]
+Test Epoch 102 ==> 	accuracy: 0.9709, 	precision: 0.9766, 	recall: 0.8716, 	specificity: 0.9949, 	f1: 0.9211, 	loss0.9938
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 103: 100%|██████████| 6137/6137 [09:26<00:00, 10.84it/s, loss=0.0221]
+Train Epoch 103 ==> 	accuracy: 0.9224, 	precision: 0.9997, 	recall: 0.8450, 	specificity: 0.9998, 	f1: 0.9159,	 loss0.2132
+Test Epoch 103: 100%|██████████| 1748/1748 [01:04<00:00, 26.93it/s, loss=0.0674]
+Test Epoch 103 ==> 	accuracy: 0.9701, 	precision: 0.9820, 	recall: 0.8627, 	specificity: 0.9962, 	f1: 0.9185, 	loss0.7823
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 104: 100%|██████████| 6137/6137 [09:21<00:00, 10.93it/s, loss=0.16]
+Train Epoch 104 ==> 	accuracy: 0.9258, 	precision: 0.9998, 	recall: 0.8518, 	specificity: 0.9998, 	f1: 0.9198,	 loss0.2048
+Test Epoch 104: 100%|██████████| 1748/1748 [01:03<00:00, 27.46it/s, loss=0.0693]
+Test Epoch 104 ==> 	accuracy: 0.9704, 	precision: 0.9788, 	recall: 0.8672, 	specificity: 0.9955, 	f1: 0.9196, 	loss0.8960
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 105: 100%|██████████| 6137/6137 [09:38<00:00, 10.60it/s, loss=0.0111]
+Train Epoch 105 ==> 	accuracy: 0.9258, 	precision: 0.9997, 	recall: 0.8518, 	specificity: 0.9998, 	f1: 0.9199,	 loss0.2035
+Test Epoch 105: 100%|██████████| 1748/1748 [01:07<00:00, 25.88it/s, loss=0.101]
+Test Epoch 105 ==> 	accuracy: 0.9704, 	precision: 0.9795, 	recall: 0.8663, 	specificity: 0.9956, 	f1: 0.9194, 	loss0.8421
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 106: 100%|██████████| 6137/6137 [09:21<00:00, 10.93it/s, loss=0.0145]
+Train Epoch 106 ==> 	accuracy: 0.9253, 	precision: 0.9997, 	recall: 0.8508, 	specificity: 0.9998, 	f1: 0.9193,	 loss0.2072
+Test Epoch 106: 100%|██████████| 1748/1748 [01:07<00:00, 25.95it/s, loss=2.16]
+Test Epoch 106 ==> 	accuracy: 0.9704, 	precision: 0.9789, 	recall: 0.8670, 	specificity: 0.9955, 	f1: 0.9195, 	loss1.0118
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 107: 100%|██████████| 6137/6137 [09:29<00:00, 10.78it/s, loss=0.0059]
+Train Epoch 107 ==> 	accuracy: 0.9256, 	precision: 0.9998, 	recall: 0.8514, 	specificity: 0.9998, 	f1: 0.9196,	 loss0.2027
+Test Epoch 107: 100%|██████████| 1748/1748 [01:04<00:00, 26.98it/s, loss=0.0795]
+Test Epoch 107 ==> 	accuracy: 0.9711, 	precision: 0.9789, 	recall: 0.8704, 	specificity: 0.9955, 	f1: 0.9215, 	loss0.9587
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 108: 100%|██████████| 6137/6137 [09:23<00:00, 10.89it/s, loss=0.0129]
+Train Epoch 108 ==> 	accuracy: 0.9256, 	precision: 0.9998, 	recall: 0.8514, 	specificity: 0.9998, 	f1: 0.9196,	 loss0.2067
+Test Epoch 108: 100%|██████████| 1748/1748 [01:06<00:00, 26.40it/s, loss=2.71]
+Test Epoch 108 ==> 	accuracy: 0.9704, 	precision: 0.9786, 	recall: 0.8675, 	specificity: 0.9954, 	f1: 0.9197, 	loss0.9303
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 109: 100%|██████████| 6137/6137 [09:26<00:00, 10.83it/s, loss=0.554]
+Train Epoch 109 ==> 	accuracy: 0.9278, 	precision: 0.9998, 	recall: 0.8558, 	specificity: 0.9998, 	f1: 0.9222,	 loss0.2004
+Test Epoch 109: 100%|██████████| 1748/1748 [01:01<00:00, 28.20it/s, loss=0.106]
+Test Epoch 109 ==> 	accuracy: 0.9710, 	precision: 0.9774, 	recall: 0.8715, 	specificity: 0.9951, 	f1: 0.9214, 	loss1.0743
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 110: 100%|██████████| 6137/6137 [09:27<00:00, 10.81it/s, loss=0.0123]
+Train Epoch 110 ==> 	accuracy: 0.9275, 	precision: 0.9998, 	recall: 0.8552, 	specificity: 0.9998, 	f1: 0.9219,	 loss0.2022
+Test Epoch 110: 100%|██████████| 1748/1748 [01:09<00:00, 25.09it/s, loss=1.05]
+Test Epoch 110 ==> 	accuracy: 0.9702, 	precision: 0.9762, 	recall: 0.8686, 	specificity: 0.9949, 	f1: 0.9193, 	loss1.1149
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 111: 100%|██████████| 6137/6137 [09:20<00:00, 10.95it/s, loss=0.0048]
+Train Epoch 111 ==> 	accuracy: 0.9281, 	precision: 0.9998, 	recall: 0.8565, 	specificity: 0.9998, 	f1: 0.9226,	 loss0.1983
+Test Epoch 111: 100%|██████████| 1748/1748 [01:04<00:00, 27.23it/s, loss=0.0626]
+Test Epoch 111 ==> 	accuracy: 0.9714, 	precision: 0.9758, 	recall: 0.8749, 	specificity: 0.9947, 	f1: 0.9226, 	loss1.0044
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 112: 100%|██████████| 6137/6137 [09:31<00:00, 10.74it/s, loss=0.0249]
+Train Epoch 112 ==> 	accuracy: 0.9284, 	precision: 0.9998, 	recall: 0.8570, 	specificity: 0.9998, 	f1: 0.9229,	 loss0.2006
+Test Epoch 112: 100%|██████████| 1748/1748 [01:05<00:00, 26.52it/s, loss=0.0876]
+Test Epoch 112 ==> 	accuracy: 0.9708, 	precision: 0.9768, 	recall: 0.8712, 	specificity: 0.9950, 	f1: 0.9210, 	loss1.0522
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 113: 100%|██████████| 6137/6137 [09:27<00:00, 10.81it/s, loss=0.0013]
+Train Epoch 113 ==> 	accuracy: 0.9279, 	precision: 0.9997, 	recall: 0.8560, 	specificity: 0.9998, 	f1: 0.9223,	 loss0.2013
+Test Epoch 113: 100%|██████████| 1748/1748 [01:03<00:00, 27.42it/s, loss=0.104]
+Test Epoch 113 ==> 	accuracy: 0.9717, 	precision: 0.9753, 	recall: 0.8771, 	specificity: 0.9946, 	f1: 0.9236, 	loss1.1243
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 114: 100%|██████████| 6137/6137 [09:37<00:00, 10.62it/s, loss=0.0109]
+Train Epoch 114 ==> 	accuracy: 0.9269, 	precision: 0.9998, 	recall: 0.8539, 	specificity: 0.9998, 	f1: 0.9211,	 loss0.2012
+Test Epoch 114: 100%|██████████| 1748/1748 [01:01<00:00, 28.39it/s, loss=0.127]
+Test Epoch 114 ==> 	accuracy: 0.9710, 	precision: 0.9727, 	recall: 0.8760, 	specificity: 0.9940, 	f1: 0.9218, 	loss1.1882
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 115: 100%|██████████| 6137/6137 [09:17<00:00, 11.00it/s, loss=0.0219]
+Train Epoch 115 ==> 	accuracy: 0.9293, 	precision: 0.9998, 	recall: 0.8587, 	specificity: 0.9998, 	f1: 0.9239,	 loss0.1948
+Test Epoch 115: 100%|██████████| 1748/1748 [01:01<00:00, 28.63it/s, loss=3.17]
+Test Epoch 115 ==> 	accuracy: 0.9713, 	precision: 0.9748, 	recall: 0.8756, 	specificity: 0.9945, 	f1: 0.9225, 	loss1.1044
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 116: 100%|██████████| 6137/6137 [09:21<00:00, 10.93it/s, loss=0.0094]
+Train Epoch 116 ==> 	accuracy: 0.9274, 	precision: 0.9998, 	recall: 0.8551, 	specificity: 0.9998, 	f1: 0.9218,	 loss0.2022
+Test Epoch 116: 100%|██████████| 1748/1748 [01:04<00:00, 27.00it/s, loss=0.0328]
+Test Epoch 116 ==> 	accuracy: 0.9709, 	precision: 0.9749, 	recall: 0.8733, 	specificity: 0.9946, 	f1: 0.9213, 	loss1.1279
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 117: 100%|██████████| 6137/6137 [09:19<00:00, 10.96it/s, loss=0.0088]
+Train Epoch 117 ==> 	accuracy: 0.9292, 	precision: 0.9998, 	recall: 0.8586, 	specificity: 0.9998, 	f1: 0.9238,	 loss0.1972
+Test Epoch 117: 100%|██████████| 1748/1748 [00:56<00:00, 30.71it/s, loss=0.0649]
+Test Epoch 117 ==> 	accuracy: 0.9720, 	precision: 0.9758, 	recall: 0.8782, 	specificity: 0.9947, 	f1: 0.9244, 	loss1.0811
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 118: 100%|██████████| 6137/6137 [09:10<00:00, 11.15it/s, loss=0.0062]
+Train Epoch 118 ==> 	accuracy: 0.9292, 	precision: 0.9998, 	recall: 0.8586, 	specificity: 0.9998, 	f1: 0.9238,	 loss0.1963
+Test Epoch 118: 100%|██████████| 1748/1748 [01:03<00:00, 27.73it/s, loss=0.114]
+Test Epoch 118 ==> 	accuracy: 0.9714, 	precision: 0.9758, 	recall: 0.8749, 	specificity: 0.9947, 	f1: 0.9226, 	loss1.0798
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 119: 100%|██████████| 6137/6137 [09:08<00:00, 11.19it/s, loss=0.0007]
+Train Epoch 119 ==> 	accuracy: 0.9281, 	precision: 0.9998, 	recall: 0.8563, 	specificity: 0.9998, 	f1: 0.9225,	 loss0.1995
+Test Epoch 119: 100%|██████████| 1748/1748 [01:01<00:00, 28.41it/s, loss=0.137]
+Test Epoch 119 ==> 	accuracy: 0.9716, 	precision: 0.9815, 	recall: 0.8708, 	specificity: 0.9960, 	f1: 0.9229, 	loss0.9908
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 120: 100%|██████████| 6137/6137 [08:49<00:00, 11.60it/s, loss=0.027]
+Train Epoch 120 ==> 	accuracy: 0.9274, 	precision: 0.9998, 	recall: 0.8550, 	specificity: 0.9998, 	f1: 0.9217,	 loss0.2005
+Test Epoch 120: 100%|██████████| 1748/1748 [00:57<00:00, 30.23it/s, loss=0.0285]
+Test Epoch 120 ==> 	accuracy: 0.9715, 	precision: 0.9830, 	recall: 0.8690, 	specificity: 0.9964, 	f1: 0.9225, 	loss0.8593
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 121: 100%|██████████| 6137/6137 [08:33<00:00, 11.96it/s, loss=0.0229]
+Train Epoch 121 ==> 	accuracy: 0.9266, 	precision: 0.9998, 	recall: 0.8534, 	specificity: 0.9998, 	f1: 0.9208,	 loss0.2055
+Test Epoch 121: 100%|██████████| 1748/1748 [00:58<00:00, 29.82it/s, loss=0.0743]
+Test Epoch 121 ==> 	accuracy: 0.9716, 	precision: 0.9824, 	recall: 0.8699, 	specificity: 0.9962, 	f1: 0.9227, 	loss0.8671
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 122: 100%|██████████| 6137/6137 [08:36<00:00, 11.89it/s, loss=0.0312]
+Train Epoch 122 ==> 	accuracy: 0.9295, 	precision: 0.9997, 	recall: 0.8593, 	specificity: 0.9998, 	f1: 0.9242,	 loss0.1944
+Test Epoch 122: 100%|██████████| 1748/1748 [01:01<00:00, 28.54it/s, loss=0.0847]
+Test Epoch 122 ==> 	accuracy: 0.9715, 	precision: 0.9814, 	recall: 0.8704, 	specificity: 0.9960, 	f1: 0.9226, 	loss0.8784
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 123: 100%|██████████| 6137/6137 [08:57<00:00, 11.43it/s, loss=0.01]
+Train Epoch 123 ==> 	accuracy: 0.9271, 	precision: 0.9997, 	recall: 0.8544, 	specificity: 0.9998, 	f1: 0.9214,	 loss0.2046
+Test Epoch 123: 100%|██████████| 1748/1748 [00:57<00:00, 30.17it/s, loss=0.248]
+Test Epoch 123 ==> 	accuracy: 0.9718, 	precision: 0.9813, 	recall: 0.8724, 	specificity: 0.9960, 	f1: 0.9236, 	loss0.9493
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 124: 100%|██████████| 6137/6137 [08:53<00:00, 11.51it/s, loss=0.0015]
+Train Epoch 124 ==> 	accuracy: 0.9296, 	precision: 0.9998, 	recall: 0.8594, 	specificity: 0.9998, 	f1: 0.9243,	 loss0.1919
+Test Epoch 124: 100%|██████████| 1748/1748 [00:58<00:00, 29.71it/s, loss=0.772]
+Test Epoch 124 ==> 	accuracy: 0.9726, 	precision: 0.9786, 	recall: 0.8789, 	specificity: 0.9953, 	f1: 0.9261, 	loss1.1120
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 125: 100%|██████████| 6137/6137 [08:53<00:00, 11.51it/s, loss=0.0086]
+Train Epoch 125 ==> 	accuracy: 0.9284, 	precision: 0.9998, 	recall: 0.8571, 	specificity: 0.9998, 	f1: 0.9229,	 loss0.2027
+Test Epoch 125: 100%|██████████| 1748/1748 [00:58<00:00, 30.13it/s, loss=2.85]
+Test Epoch 125 ==> 	accuracy: 0.9722, 	precision: 0.9798, 	recall: 0.8756, 	specificity: 0.9956, 	f1: 0.9248, 	loss1.0203
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 126: 100%|██████████| 6137/6137 [08:50<00:00, 11.57it/s, loss=0.0088]
+Train Epoch 126 ==> 	accuracy: 0.9311, 	precision: 0.9998, 	recall: 0.8624, 	specificity: 0.9998, 	f1: 0.9260,	 loss0.1896
+Test Epoch 126: 100%|██████████| 1748/1748 [01:00<00:00, 29.05it/s, loss=0.341]
+Test Epoch 126 ==> 	accuracy: 0.9720, 	precision: 0.9804, 	recall: 0.8739, 	specificity: 0.9958, 	f1: 0.9241, 	loss1.0046
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 127: 100%|██████████| 6137/6137 [08:44<00:00, 11.70it/s, loss=0.0034]
+Train Epoch 127 ==> 	accuracy: 0.9295, 	precision: 0.9998, 	recall: 0.8592, 	specificity: 0.9998, 	f1: 0.9242,	 loss0.1986
+Test Epoch 127: 100%|██████████| 1748/1748 [00:56<00:00, 30.72it/s, loss=0.0576]
+Test Epoch 127 ==> 	accuracy: 0.9717, 	precision: 0.9786, 	recall: 0.8743, 	specificity: 0.9954, 	f1: 0.9235, 	loss1.1195
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 128: 100%|██████████| 6137/6137 [08:46<00:00, 11.65it/s, loss=0.0012]
+Train Epoch 128 ==> 	accuracy: 0.9311, 	precision: 0.9998, 	recall: 0.8625, 	specificity: 0.9998, 	f1: 0.9261,	 loss0.1904
+Test Epoch 128: 100%|██████████| 1748/1748 [00:55<00:00, 31.56it/s, loss=0.0784]
+Test Epoch 128 ==> 	accuracy: 0.9720, 	precision: 0.9795, 	recall: 0.8746, 	specificity: 0.9956, 	f1: 0.9241, 	loss1.1425
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 129: 100%|██████████| 6137/6137 [08:55<00:00, 11.45it/s, loss=0.0094]
+Train Epoch 129 ==> 	accuracy: 0.9286, 	precision: 0.9998, 	recall: 0.8574, 	specificity: 0.9998, 	f1: 0.9231,	 loss0.1988
+Test Epoch 129: 100%|██████████| 1748/1748 [00:57<00:00, 30.28it/s, loss=1.95]
+Test Epoch 129 ==> 	accuracy: 0.9708, 	precision: 0.9815, 	recall: 0.8665, 	specificity: 0.9961, 	f1: 0.9204, 	loss0.9376
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 130: 100%|██████████| 6137/6137 [08:47<00:00, 11.65it/s, loss=0.0732]
+Train Epoch 130 ==> 	accuracy: 0.9307, 	precision: 0.9998, 	recall: 0.8615, 	specificity: 0.9998, 	f1: 0.9255,	 loss0.1917
+Test Epoch 130: 100%|██████████| 1748/1748 [00:59<00:00, 29.62it/s, loss=1.41]
+Test Epoch 130 ==> 	accuracy: 0.9723, 	precision: 0.9787, 	recall: 0.8771, 	specificity: 0.9954, 	f1: 0.9251, 	loss1.1365
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 131: 100%|██████████| 6137/6137 [08:51<00:00, 11.54it/s, loss=0.0131]
+Train Epoch 131 ==> 	accuracy: 0.9309, 	precision: 0.9998, 	recall: 0.8620, 	specificity: 0.9998, 	f1: 0.9258,	 loss0.1924
+Test Epoch 131: 100%|██████████| 1748/1748 [00:59<00:00, 29.17it/s, loss=0.121]
+Test Epoch 131 ==> 	accuracy: 0.9722, 	precision: 0.9781, 	recall: 0.8773, 	specificity: 0.9952, 	f1: 0.9250, 	loss1.0727
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 132: 100%|██████████| 6137/6137 [09:13<00:00, 11.09it/s, loss=0.0232]
+Train Epoch 132 ==> 	accuracy: 0.9305, 	precision: 0.9998, 	recall: 0.8611, 	specificity: 0.9998, 	f1: 0.9253,	 loss0.1956
+Test Epoch 132: 100%|██████████| 1748/1748 [00:59<00:00, 29.33it/s, loss=0.0436]
+Test Epoch 132 ==> 	accuracy: 0.9722, 	precision: 0.9784, 	recall: 0.8772, 	specificity: 0.9953, 	f1: 0.9250, 	loss1.0720
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 133: 100%|██████████| 6137/6137 [09:02<00:00, 11.31it/s, loss=0.0087]
+Train Epoch 133 ==> 	accuracy: 0.9308, 	precision: 0.9998, 	recall: 0.8617, 	specificity: 0.9998, 	f1: 0.9256,	 loss0.1926
+Test Epoch 133: 100%|██████████| 1748/1748 [00:56<00:00, 31.07it/s, loss=0.0674]
+Test Epoch 133 ==> 	accuracy: 0.9726, 	precision: 0.9764, 	recall: 0.8811, 	specificity: 0.9948, 	f1: 0.9263, 	loss1.1791
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 134: 100%|██████████| 6137/6137 [08:40<00:00, 11.80it/s, loss=0.0049]
+Train Epoch 134 ==> 	accuracy: 0.9300, 	precision: 0.9998, 	recall: 0.8603, 	specificity: 0.9998, 	f1: 0.9248,	 loss0.1942
+Test Epoch 134: 100%|██████████| 1748/1748 [01:00<00:00, 29.03it/s, loss=0.225]
+Test Epoch 134 ==> 	accuracy: 0.9722, 	precision: 0.9779, 	recall: 0.8776, 	specificity: 0.9952, 	f1: 0.9250, 	loss1.1709
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 135: 100%|██████████| 6137/6137 [09:08<00:00, 11.19it/s, loss=0.0279]
+Train Epoch 135 ==> 	accuracy: 0.9322, 	precision: 0.9998, 	recall: 0.8646, 	specificity: 0.9998, 	f1: 0.9273,	 loss0.1895
+Test Epoch 135: 100%|██████████| 1748/1748 [01:04<00:00, 27.26it/s, loss=0.0137]
+Test Epoch 135 ==> 	accuracy: 0.9724, 	precision: 0.9774, 	recall: 0.8788, 	specificity: 0.9951, 	f1: 0.9255, 	loss1.2000
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 136: 100%|██████████| 6137/6137 [09:11<00:00, 11.12it/s, loss=0.0268]
+Train Epoch 136 ==> 	accuracy: 0.9302, 	precision: 0.9998, 	recall: 0.8605, 	specificity: 0.9998, 	f1: 0.9249,	 loss0.1931
+Test Epoch 136: 100%|██████████| 1748/1748 [00:58<00:00, 29.94it/s, loss=1.13]
+Test Epoch 136 ==> 	accuracy: 0.9723, 	precision: 0.9781, 	recall: 0.8778, 	specificity: 0.9952, 	f1: 0.9252, 	loss1.1325
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 137: 100%|██████████| 6137/6137 [08:58<00:00, 11.40it/s, loss=0.0052]
+Train Epoch 137 ==> 	accuracy: 0.9313, 	precision: 0.9998, 	recall: 0.8628, 	specificity: 0.9998, 	f1: 0.9262,	 loss0.1908
+Test Epoch 137: 100%|██████████| 1748/1748 [00:58<00:00, 29.73it/s, loss=0.0449]
+Test Epoch 137 ==> 	accuracy: 0.9724, 	precision: 0.9770, 	recall: 0.8793, 	specificity: 0.9950, 	f1: 0.9256, 	loss1.1616
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 138: 100%|██████████| 6137/6137 [08:54<00:00, 11.48it/s, loss=0.0006]
+Train Epoch 138 ==> 	accuracy: 0.9307, 	precision: 0.9998, 	recall: 0.8615, 	specificity: 0.9998, 	f1: 0.9255,	 loss0.1937
+Test Epoch 138: 100%|██████████| 1748/1748 [00:59<00:00, 29.51it/s, loss=1.12]
+Test Epoch 138 ==> 	accuracy: 0.9718, 	precision: 0.9798, 	recall: 0.8735, 	specificity: 0.9956, 	f1: 0.9236, 	loss0.9907
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 139: 100%|██████████| 6137/6137 [08:34<00:00, 11.93it/s, loss=0.0319]
+Train Epoch 139 ==> 	accuracy: 0.9325, 	precision: 0.9998, 	recall: 0.8651, 	specificity: 0.9998, 	f1: 0.9276,	 loss0.1887
+Test Epoch 139: 100%|██████████| 1748/1748 [01:01<00:00, 28.57it/s, loss=0.0364]
+Test Epoch 139 ==> 	accuracy: 0.9724, 	precision: 0.9776, 	recall: 0.8786, 	specificity: 0.9951, 	f1: 0.9255, 	loss1.1341
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 140: 100%|██████████| 6137/6137 [08:50<00:00, 11.57it/s, loss=0.0086]
+Train Epoch 140 ==> 	accuracy: 0.9306, 	precision: 0.9998, 	recall: 0.8615, 	specificity: 0.9998, 	f1: 0.9255,	 loss0.1959
+Test Epoch 140: 100%|██████████| 1748/1748 [00:56<00:00, 30.98it/s, loss=0.103]
+Test Epoch 140 ==> 	accuracy: 0.9727, 	precision: 0.9772, 	recall: 0.8805, 	specificity: 0.9950, 	f1: 0.9264, 	loss1.1324
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 141: 100%|██████████| 6137/6137 [08:52<00:00, 11.52it/s, loss=0.0199]
+Train Epoch 141 ==> 	accuracy: 0.9324, 	precision: 0.9998, 	recall: 0.8649, 	specificity: 0.9998, 	f1: 0.9275,	 loss0.1882
+Test Epoch 141: 100%|██████████| 1748/1748 [00:59<00:00, 29.46it/s, loss=0.0939]
+Test Epoch 141 ==> 	accuracy: 0.9723, 	precision: 0.9786, 	recall: 0.8772, 	specificity: 0.9954, 	f1: 0.9251, 	loss1.1232
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 142: 100%|██████████| 6137/6137 [09:08<00:00, 11.20it/s, loss=0.0142]
+Train Epoch 142 ==> 	accuracy: 0.9307, 	precision: 0.9998, 	recall: 0.8616, 	specificity: 0.9998, 	f1: 0.9255,	 loss0.1952
+Test Epoch 142: 100%|██████████| 1748/1748 [01:01<00:00, 28.59it/s, loss=0.433]
+Test Epoch 142 ==> 	accuracy: 0.9720, 	precision: 0.9776, 	recall: 0.8763, 	specificity: 0.9951, 	f1: 0.9242, 	loss1.0829
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 143: 100%|██████████| 6137/6137 [09:12<00:00, 11.11it/s, loss=0.0101]
+Train Epoch 143 ==> 	accuracy: 0.9328, 	precision: 0.9998, 	recall: 0.8659, 	specificity: 0.9998, 	f1: 0.9280,	 loss0.1845
+Test Epoch 143: 100%|██████████| 1748/1748 [01:01<00:00, 28.49it/s, loss=0.0839]
+Test Epoch 143 ==> 	accuracy: 0.9726, 	precision: 0.9763, 	recall: 0.8811, 	specificity: 0.9948, 	f1: 0.9262, 	loss1.2030
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 144: 100%|██████████| 6137/6137 [09:01<00:00, 11.33it/s, loss=0.0159]
+Train Epoch 144 ==> 	accuracy: 0.9312, 	precision: 0.9998, 	recall: 0.8626, 	specificity: 0.9998, 	f1: 0.9262,	 loss0.1926
+Test Epoch 144: 100%|██████████| 1748/1748 [00:58<00:00, 29.99it/s, loss=0.184]
+Test Epoch 144 ==> 	accuracy: 0.9725, 	precision: 0.9787, 	recall: 0.8779, 	specificity: 0.9954, 	f1: 0.9256, 	loss1.1189
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 145: 100%|██████████| 6137/6137 [09:03<00:00, 11.29it/s, loss=0.0148]
+Train Epoch 145 ==> 	accuracy: 0.9318, 	precision: 0.9998, 	recall: 0.8639, 	specificity: 0.9998, 	f1: 0.9269,	 loss0.1889
+Test Epoch 145: 100%|██████████| 1748/1748 [01:01<00:00, 28.31it/s, loss=0.254]
+Test Epoch 145 ==> 	accuracy: 0.9727, 	precision: 0.9781, 	recall: 0.8799, 	specificity: 0.9952, 	f1: 0.9264, 	loss1.1340
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 146: 100%|██████████| 6137/6137 [08:55<00:00, 11.45it/s, loss=0.0042]
+Train Epoch 146 ==> 	accuracy: 0.9316, 	precision: 0.9998, 	recall: 0.8634, 	specificity: 0.9998, 	f1: 0.9266,	 loss0.1903
+Test Epoch 146: 100%|██████████| 1748/1748 [00:59<00:00, 29.48it/s, loss=0.118]
+Test Epoch 146 ==> 	accuracy: 0.9726, 	precision: 0.9783, 	recall: 0.8792, 	specificity: 0.9953, 	f1: 0.9261, 	loss1.1033
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 147: 100%|██████████| 6137/6137 [09:05<00:00, 11.26it/s, loss=0.0048]
+Train Epoch 147 ==> 	accuracy: 0.9321, 	precision: 0.9998, 	recall: 0.8643, 	specificity: 0.9998, 	f1: 0.9272,	 loss0.1891
+Test Epoch 147: 100%|██████████| 1748/1748 [00:57<00:00, 30.22it/s, loss=0.0935]
+Test Epoch 147 ==> 	accuracy: 0.9729, 	precision: 0.9762, 	recall: 0.8824, 	specificity: 0.9948, 	f1: 0.9269, 	loss1.1922
+Adjusting learning rate of group 0 to 5.8150e-06.
+Train Epoch 148: 100%|██████████| 6137/6137 [09:00<00:00, 11.36it/s, loss=0.0054]
+Train Epoch 148 ==> 	accuracy: 0.9333, 	precision: 0.9998, 	recall: 0.8668, 	specificity: 0.9998, 	f1: 0.9285,	 loss0.1859
+Test Epoch 148: 100%|██████████| 1748/1748 [01:00<00:00, 29.02it/s, loss=0.0155]
+Test Epoch 148 ==> 	accuracy: 0.9728, 	precision: 0.9773, 	recall: 0.8812, 	specificity: 0.9950, 	f1: 0.9268, 	loss1.1818
+Adjusting learning rate of group 0 to 5.8150e-06.
+Train Epoch 149: 100%|██████████| 6137/6137 [09:00<00:00, 11.36it/s, loss=0.0339]
+Train Epoch 149 ==> 	accuracy: 0.9321, 	precision: 0.9998, 	recall: 0.8643, 	specificity: 0.9998, 	f1: 0.9271,	 loss0.1891
+Test Epoch 149: 100%|██████████| 1748/1748 [00:58<00:00, 29.86it/s, loss=0.597]
+Test Epoch 149 ==> 	accuracy: 0.9723, 	precision: 0.9780, 	recall: 0.8778, 	specificity: 0.9952, 	f1: 0.9252, 	loss1.1629
+Adjusting learning rate of group 0 to 5.8150e-06.
+
+进程已结束，退出代码为 0
+
+'''
+
+'''
+ab mha
+/home/bio/anaconda3/bin/python /home/bio/bio_seq/oxog/oxog/script/train.py 
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 0: 100%|██████████| 6137/6137 [05:23<00:00, 18.96it/s, loss=0.168]
+Train Epoch 0 ==> 	accuracy: 0.6731, 	precision: 0.9962, 	recall: 0.3476, 	specificity: 0.9987, 	f1: 0.5153,	 loss1.0576
+Test Epoch 0: 100%|██████████| 1748/1748 [00:37<00:00, 47.04it/s, loss=0.606]
+Test Epoch 0 ==> 	accuracy: 0.9196, 	precision: 0.9256, 	recall: 0.6395, 	specificity: 0.9875, 	f1: 0.7564, 	loss1.2001
+Train Epoch 1: 100%|██████████| 6137/6137 [06:19<00:00, 16.17it/s, loss=0.124]
+Train Epoch 1 ==> 	accuracy: 0.7651, 	precision: 0.9977, 	recall: 0.5314, 	specificity: 0.9988, 	f1: 0.6934,	 loss0.8545
+Test Epoch 1: 100%|██████████| 1748/1748 [00:40<00:00, 43.42it/s, loss=0.573]
+Test Epoch 1 ==> 	accuracy: 0.9316, 	precision: 0.9652, 	recall: 0.6739, 	specificity: 0.9941, 	f1: 0.7936, 	loss0.7757
+Train Epoch 2: 100%|██████████| 6137/6137 [06:18<00:00, 16.22it/s, loss=0.174]
+Train Epoch 2 ==> 	accuracy: 0.7940, 	precision: 0.9982, 	recall: 0.5891, 	specificity: 0.9989, 	f1: 0.7409,	 loss0.7702
+Test Epoch 2: 100%|██████████| 1748/1748 [00:38<00:00, 44.83it/s, loss=0.172]
+Test Epoch 2 ==> 	accuracy: 0.9377, 	precision: 0.9755, 	recall: 0.6983, 	specificity: 0.9957, 	f1: 0.8139, 	loss0.6127
+Train Epoch 3: 100%|██████████| 6137/6137 [06:20<00:00, 16.12it/s, loss=0.127]
+Train Epoch 3 ==> 	accuracy: 0.8021, 	precision: 0.9983, 	recall: 0.6052, 	specificity: 0.9990, 	f1: 0.7536,	 loss0.7567
+Test Epoch 3: 100%|██████████| 1748/1748 [00:38<00:00, 44.89it/s, loss=0.137]
+Test Epoch 3 ==> 	accuracy: 0.9360, 	precision: 0.9869, 	recall: 0.6812, 	specificity: 0.9978, 	f1: 0.8061, 	loss0.4661
+Train Epoch 4: 100%|██████████| 6137/6137 [06:23<00:00, 15.98it/s, loss=0.137]
+Train Epoch 4 ==> 	accuracy: 0.8128, 	precision: 0.9985, 	recall: 0.6265, 	specificity: 0.9991, 	f1: 0.7699,	 loss0.7212
+Test Epoch 4: 100%|██████████| 1748/1748 [00:38<00:00, 45.52it/s, loss=0.239]
+Test Epoch 4 ==> 	accuracy: 0.9348, 	precision: 0.9863, 	recall: 0.6750, 	specificity: 0.9977, 	f1: 0.8015, 	loss0.4604
+Train Epoch 5: 100%|██████████| 6137/6137 [06:29<00:00, 15.74it/s, loss=0.157]
+Train Epoch 5 ==> 	accuracy: 0.8182, 	precision: 0.9986, 	recall: 0.6373, 	specificity: 0.9991, 	f1: 0.7780,	 loss0.7076
+Test Epoch 5: 100%|██████████| 1748/1748 [00:41<00:00, 42.41it/s, loss=0.118]
+Test Epoch 5 ==> 	accuracy: 0.9352, 	precision: 0.9901, 	recall: 0.6747, 	specificity: 0.9984, 	f1: 0.8025, 	loss0.4283
+Train Epoch 6: 100%|██████████| 6137/6137 [06:16<00:00, 16.29it/s, loss=0.13]
+Train Epoch 6 ==> 	accuracy: 0.8231, 	precision: 0.9987, 	recall: 0.6470, 	specificity: 0.9992, 	f1: 0.7853,	 loss0.6920
+Test Epoch 6: 100%|██████████| 1748/1748 [00:39<00:00, 43.92it/s, loss=0.154]
+Test Epoch 6 ==> 	accuracy: 0.9373, 	precision: 0.9869, 	recall: 0.6879, 	specificity: 0.9978, 	f1: 0.8107, 	loss0.4698
+Train Epoch 7: 100%|██████████| 6137/6137 [06:16<00:00, 16.32it/s, loss=0.0812]
+Train Epoch 7 ==> 	accuracy: 0.8290, 	precision: 0.9987, 	recall: 0.6588, 	specificity: 0.9992, 	f1: 0.7939,	 loss0.6743
+Test Epoch 7: 100%|██████████| 1748/1748 [00:40<00:00, 42.92it/s, loss=0.672]
+Test Epoch 7 ==> 	accuracy: 0.9452, 	precision: 0.9823, 	recall: 0.7322, 	specificity: 0.9968, 	f1: 0.8390, 	loss0.5312
+Train Epoch 8: 100%|██████████| 6137/6137 [06:18<00:00, 16.23it/s, loss=0.128]
+Train Epoch 8 ==> 	accuracy: 0.8280, 	precision: 0.9988, 	recall: 0.6568, 	specificity: 0.9992, 	f1: 0.7925,	 loss0.6796
+Test Epoch 8: 100%|██████████| 1748/1748 [00:38<00:00, 44.99it/s, loss=0.181]
+Test Epoch 8 ==> 	accuracy: 0.9433, 	precision: 0.9758, 	recall: 0.7275, 	specificity: 0.9956, 	f1: 0.8335, 	loss0.6787
+Train Epoch 9: 100%|██████████| 6137/6137 [06:18<00:00, 16.23it/s, loss=0.105]
+Train Epoch 9 ==> 	accuracy: 0.8319, 	precision: 0.9989, 	recall: 0.6646, 	specificity: 0.9993, 	f1: 0.7981,	 loss0.6630
+Test Epoch 9: 100%|██████████| 1748/1748 [00:39<00:00, 44.44it/s, loss=0.132]
+Test Epoch 9 ==> 	accuracy: 0.9425, 	precision: 0.9835, 	recall: 0.7174, 	specificity: 0.9971, 	f1: 0.8296, 	loss0.5318
+Train Epoch 10: 100%|██████████| 6137/6137 [06:13<00:00, 16.45it/s, loss=0.13]
+Train Epoch 10 ==> 	accuracy: 0.8351, 	precision: 0.9990, 	recall: 0.6708, 	specificity: 0.9993, 	f1: 0.8027,	 loss0.6555
+Test Epoch 10: 100%|██████████| 1748/1748 [00:38<00:00, 45.23it/s, loss=0.229]
+Test Epoch 10 ==> 	accuracy: 0.9403, 	precision: 0.9839, 	recall: 0.7054, 	specificity: 0.9972, 	f1: 0.8217, 	loss0.5318
+Train Epoch 11: 100%|██████████| 6137/6137 [06:13<00:00, 16.41it/s, loss=0.0972]
+Train Epoch 11 ==> 	accuracy: 0.8372, 	precision: 0.9990, 	recall: 0.6751, 	specificity: 0.9993, 	f1: 0.8057,	 loss0.6480
+Test Epoch 11: 100%|██████████| 1748/1748 [00:38<00:00, 45.34it/s, loss=0.211]
+Test Epoch 11 ==> 	accuracy: 0.9495, 	precision: 0.9842, 	recall: 0.7531, 	specificity: 0.9971, 	f1: 0.8533, 	loss0.5091
+Train Epoch 12: 100%|██████████| 6137/6137 [06:11<00:00, 16.53it/s, loss=0.0636]
+Train Epoch 12 ==> 	accuracy: 0.8370, 	precision: 0.9990, 	recall: 0.6746, 	specificity: 0.9993, 	f1: 0.8054,	 loss0.6474
+Test Epoch 12: 100%|██████████| 1748/1748 [00:38<00:00, 45.16it/s, loss=0.099]
+Test Epoch 12 ==> 	accuracy: 0.9445, 	precision: 0.9875, 	recall: 0.7246, 	specificity: 0.9978, 	f1: 0.8359, 	loss0.4636
+Train Epoch 13: 100%|██████████| 6137/6137 [06:14<00:00, 16.39it/s, loss=0.0996]
+Train Epoch 13 ==> 	accuracy: 0.8430, 	precision: 0.9991, 	recall: 0.6867, 	specificity: 0.9994, 	f1: 0.8140,	 loss0.6324
+Test Epoch 13: 100%|██████████| 1748/1748 [00:38<00:00, 45.59it/s, loss=0.861]
+Test Epoch 13 ==> 	accuracy: 0.9460, 	precision: 0.9745, 	recall: 0.7427, 	specificity: 0.9953, 	f1: 0.8430, 	loss0.6610
+Train Epoch 14: 100%|██████████| 6137/6137 [06:09<00:00, 16.62it/s, loss=0.0015]
+Train Epoch 14 ==> 	accuracy: 0.8451, 	precision: 0.9991, 	recall: 0.6908, 	specificity: 0.9994, 	f1: 0.8168,	 loss0.6215
+Test Epoch 14: 100%|██████████| 1748/1748 [00:36<00:00, 47.89it/s, loss=0.107]
+Test Epoch 14 ==> 	accuracy: 0.9463, 	precision: 0.9855, 	recall: 0.7354, 	specificity: 0.9974, 	f1: 0.8423, 	loss0.5019
+Train Epoch 15: 100%|██████████| 6137/6137 [06:09<00:00, 16.59it/s, loss=0.123]
+Train Epoch 15 ==> 	accuracy: 0.8438, 	precision: 0.9991, 	recall: 0.6882, 	specificity: 0.9994, 	f1: 0.8150,	 loss0.6313
+Test Epoch 15: 100%|██████████| 1748/1748 [00:37<00:00, 46.22it/s, loss=0.139]
+Test Epoch 15 ==> 	accuracy: 0.9470, 	precision: 0.9794, 	recall: 0.7442, 	specificity: 0.9962, 	f1: 0.8458, 	loss0.6149
+Train Epoch 16: 100%|██████████| 6137/6137 [06:08<00:00, 16.65it/s, loss=0.128]
+Train Epoch 16 ==> 	accuracy: 0.8438, 	precision: 0.9991, 	recall: 0.6883, 	specificity: 0.9994, 	f1: 0.8151,	 loss0.6262
+Test Epoch 16: 100%|██████████| 1748/1748 [00:37<00:00, 46.65it/s, loss=0.151]
+Test Epoch 16 ==> 	accuracy: 0.9408, 	precision: 0.9911, 	recall: 0.7027, 	specificity: 0.9985, 	f1: 0.8224, 	loss0.3731
+Train Epoch 17: 100%|██████████| 6137/6137 [06:01<00:00, 16.96it/s, loss=0.0584]
+Train Epoch 17 ==> 	accuracy: 0.8453, 	precision: 0.9991, 	recall: 0.6912, 	specificity: 0.9994, 	f1: 0.8171,	 loss0.6225
+Test Epoch 17: 100%|██████████| 1748/1748 [00:40<00:00, 43.58it/s, loss=0.517]
+Test Epoch 17 ==> 	accuracy: 0.9463, 	precision: 0.9831, 	recall: 0.7376, 	specificity: 0.9969, 	f1: 0.8428, 	loss0.5426
+Train Epoch 18: 100%|██████████| 6137/6137 [06:14<00:00, 16.38it/s, loss=0.0926]
+Train Epoch 18 ==> 	accuracy: 0.8510, 	precision: 0.9992, 	recall: 0.7026, 	specificity: 0.9994, 	f1: 0.8251,	 loss0.6097
+Test Epoch 18: 100%|██████████| 1748/1748 [00:40<00:00, 43.31it/s, loss=0.344]
+Test Epoch 18 ==> 	accuracy: 0.9461, 	precision: 0.9763, 	recall: 0.7418, 	specificity: 0.9956, 	f1: 0.8430, 	loss0.6642
+Train Epoch 19: 100%|██████████| 6137/6137 [06:05<00:00, 16.77it/s, loss=0.0477]
+Train Epoch 19 ==> 	accuracy: 0.8523, 	precision: 0.9992, 	recall: 0.7051, 	specificity: 0.9994, 	f1: 0.8268,	 loss0.6066
+Test Epoch 19: 100%|██████████| 1748/1748 [00:40<00:00, 42.84it/s, loss=1.18]
+Test Epoch 19 ==> 	accuracy: 0.9516, 	precision: 0.9707, 	recall: 0.7755, 	specificity: 0.9943, 	f1: 0.8622, 	loss0.8496
+Train Epoch 20: 100%|██████████| 6137/6137 [06:10<00:00, 16.58it/s, loss=0.0439]
+Train Epoch 20 ==> 	accuracy: 0.8504, 	precision: 0.9992, 	recall: 0.7014, 	specificity: 0.9994, 	f1: 0.8242,	 loss0.6123
+Test Epoch 20: 100%|██████████| 1748/1748 [00:36<00:00, 47.84it/s, loss=0.592]
+Test Epoch 20 ==> 	accuracy: 0.9485, 	precision: 0.9835, 	recall: 0.7487, 	specificity: 0.9970, 	f1: 0.8502, 	loss0.5073
+Train Epoch 21: 100%|██████████| 6137/6137 [06:06<00:00, 16.74it/s, loss=0.131]
+Train Epoch 21 ==> 	accuracy: 0.8545, 	precision: 0.9992, 	recall: 0.7095, 	specificity: 0.9995, 	f1: 0.8298,	 loss0.5975
+Test Epoch 21: 100%|██████████| 1748/1748 [00:37<00:00, 47.05it/s, loss=0.222]
+Test Epoch 21 ==> 	accuracy: 0.9467, 	precision: 0.9886, 	recall: 0.7355, 	specificity: 0.9979, 	f1: 0.8435, 	loss0.4052
+Train Epoch 22: 100%|██████████| 6137/6137 [06:10<00:00, 16.55it/s, loss=0.122]
+Train Epoch 22 ==> 	accuracy: 0.8542, 	precision: 0.9992, 	recall: 0.7090, 	specificity: 0.9995, 	f1: 0.8295,	 loss0.5986
+Test Epoch 22: 100%|██████████| 1748/1748 [00:36<00:00, 47.79it/s, loss=0.128]
+Test Epoch 22 ==> 	accuracy: 0.9507, 	precision: 0.9881, 	recall: 0.7565, 	specificity: 0.9978, 	f1: 0.8570, 	loss0.4517
+Train Epoch 23: 100%|██████████| 6137/6137 [06:07<00:00, 16.70it/s, loss=0.136]
+Train Epoch 23 ==> 	accuracy: 0.8560, 	precision: 0.9993, 	recall: 0.7124, 	specificity: 0.9995, 	f1: 0.8318,	 loss0.5955
+Test Epoch 23: 100%|██████████| 1748/1748 [00:41<00:00, 42.38it/s, loss=0.179]
+Test Epoch 23 ==> 	accuracy: 0.9485, 	precision: 0.9667, 	recall: 0.7623, 	specificity: 0.9936, 	f1: 0.8524, 	loss0.8487
+Train Epoch 24: 100%|██████████| 6137/6137 [06:34<00:00, 15.57it/s, loss=0.164]
+Train Epoch 24 ==> 	accuracy: 0.8556, 	precision: 0.9992, 	recall: 0.7119, 	specificity: 0.9994, 	f1: 0.8314,	 loss0.5947
+Test Epoch 24: 100%|██████████| 1748/1748 [00:44<00:00, 38.99it/s, loss=0.136]
+Test Epoch 24 ==> 	accuracy: 0.9527, 	precision: 0.9835, 	recall: 0.7705, 	specificity: 0.9969, 	f1: 0.8641, 	loss0.5141
+Train Epoch 25: 100%|██████████| 6137/6137 [06:58<00:00, 14.66it/s, loss=0.0989]
+Train Epoch 25 ==> 	accuracy: 0.8595, 	precision: 0.9993, 	recall: 0.7196, 	specificity: 0.9995, 	f1: 0.8367,	 loss0.5844
+Test Epoch 25: 100%|██████████| 1748/1748 [00:42<00:00, 40.88it/s, loss=0.155]
+Test Epoch 25 ==> 	accuracy: 0.9515, 	precision: 0.9853, 	recall: 0.7631, 	specificity: 0.9972, 	f1: 0.8601, 	loss0.4974
+Train Epoch 26: 100%|██████████| 6137/6137 [07:01<00:00, 14.55it/s, loss=0.0235]
+Train Epoch 26 ==> 	accuracy: 0.8579, 	precision: 0.9992, 	recall: 0.7163, 	specificity: 0.9995, 	f1: 0.8344,	 loss0.5865
+Test Epoch 26: 100%|██████████| 1748/1748 [00:41<00:00, 42.22it/s, loss=0.812]
+Test Epoch 26 ==> 	accuracy: 0.9508, 	precision: 0.9802, 	recall: 0.7633, 	specificity: 0.9963, 	f1: 0.8582, 	loss0.5717
+Train Epoch 27: 100%|██████████| 6137/6137 [06:48<00:00, 15.03it/s, loss=0.0712]
+Train Epoch 27 ==> 	accuracy: 0.8600, 	precision: 0.9993, 	recall: 0.7205, 	specificity: 0.9995, 	f1: 0.8373,	 loss0.5783
+Test Epoch 27: 100%|██████████| 1748/1748 [00:40<00:00, 43.18it/s, loss=0.0983]
+Test Epoch 27 ==> 	accuracy: 0.9523, 	precision: 0.9806, 	recall: 0.7705, 	specificity: 0.9963, 	f1: 0.8630, 	loss0.6295
+Train Epoch 28: 100%|██████████| 6137/6137 [06:46<00:00, 15.09it/s, loss=0.131]
+Train Epoch 28 ==> 	accuracy: 0.8575, 	precision: 0.9993, 	recall: 0.7155, 	specificity: 0.9995, 	f1: 0.8339,	 loss0.5871
+Test Epoch 28: 100%|██████████| 1748/1748 [00:40<00:00, 43.08it/s, loss=0.742]
+Test Epoch 28 ==> 	accuracy: 0.9545, 	precision: 0.9802, 	recall: 0.7826, 	specificity: 0.9962, 	f1: 0.8703, 	loss0.6419
+Train Epoch 29: 100%|██████████| 6137/6137 [06:50<00:00, 14.95it/s, loss=0.009]
+Train Epoch 29 ==> 	accuracy: 0.8641, 	precision: 0.9993, 	recall: 0.7287, 	specificity: 0.9995, 	f1: 0.8428,	 loss0.5670
+Test Epoch 29: 100%|██████████| 1748/1748 [00:43<00:00, 40.24it/s, loss=0.0763]
+Test Epoch 29 ==> 	accuracy: 0.9504, 	precision: 0.9801, 	recall: 0.7610, 	specificity: 0.9963, 	f1: 0.8568, 	loss0.5947
+Train Epoch 30: 100%|██████████| 6137/6137 [06:44<00:00, 15.17it/s, loss=0.0812]
+Train Epoch 30 ==> 	accuracy: 0.8603, 	precision: 0.9994, 	recall: 0.7210, 	specificity: 0.9996, 	f1: 0.8377,	 loss0.5869
+Test Epoch 30: 100%|██████████| 1748/1748 [00:43<00:00, 39.97it/s, loss=0.0491]
+Test Epoch 30 ==> 	accuracy: 0.9533, 	precision: 0.9809, 	recall: 0.7756, 	specificity: 0.9963, 	f1: 0.8662, 	loss0.5735
+Train Epoch 31: 100%|██████████| 6137/6137 [06:47<00:00, 15.05it/s, loss=0.137]
+Train Epoch 31 ==> 	accuracy: 0.8657, 	precision: 0.9994, 	recall: 0.7318, 	specificity: 0.9995, 	f1: 0.8449,	 loss0.5577
+Test Epoch 31: 100%|██████████| 1748/1748 [00:42<00:00, 41.01it/s, loss=0.233]
+Test Epoch 31 ==> 	accuracy: 0.9529, 	precision: 0.9818, 	recall: 0.7732, 	specificity: 0.9965, 	f1: 0.8651, 	loss0.5877
+Train Epoch 32: 100%|██████████| 6137/6137 [07:02<00:00, 14.52it/s, loss=0.157]
+Train Epoch 32 ==> 	accuracy: 0.8618, 	precision: 0.9993, 	recall: 0.7242, 	specificity: 0.9995, 	f1: 0.8398,	 loss0.5816
+Test Epoch 32: 100%|██████████| 1748/1748 [00:43<00:00, 40.28it/s, loss=0.144]
+Test Epoch 32 ==> 	accuracy: 0.9536, 	precision: 0.9892, 	recall: 0.7706, 	specificity: 0.9980, 	f1: 0.8663, 	loss0.4200
+Train Epoch 33: 100%|██████████| 6137/6137 [06:46<00:00, 15.09it/s, loss=0.137]
+Train Epoch 33 ==> 	accuracy: 0.8647, 	precision: 0.9994, 	recall: 0.7299, 	specificity: 0.9995, 	f1: 0.8436,	 loss0.5641
+Test Epoch 33: 100%|██████████| 1748/1748 [00:46<00:00, 37.68it/s, loss=0.826]
+Test Epoch 33 ==> 	accuracy: 0.9552, 	precision: 0.9822, 	recall: 0.7844, 	specificity: 0.9965, 	f1: 0.8722, 	loss0.5307
+Train Epoch 34: 100%|██████████| 6137/6137 [06:48<00:00, 15.01it/s, loss=0.097]
+Train Epoch 34 ==> 	accuracy: 0.8639, 	precision: 0.9994, 	recall: 0.7282, 	specificity: 0.9996, 	f1: 0.8425,	 loss0.5785
+Test Epoch 34: 100%|██████████| 1748/1748 [00:41<00:00, 42.24it/s, loss=0.0851]
+Test Epoch 34 ==> 	accuracy: 0.9513, 	precision: 0.9853, 	recall: 0.7619, 	specificity: 0.9973, 	f1: 0.8593, 	loss0.4841
+Train Epoch 35: 100%|██████████| 6137/6137 [06:52<00:00, 14.88it/s, loss=0.121]
+Train Epoch 35 ==> 	accuracy: 0.8664, 	precision: 0.9994, 	recall: 0.7333, 	specificity: 0.9995, 	f1: 0.8459,	 loss0.5585
+Test Epoch 35: 100%|██████████| 1748/1748 [00:47<00:00, 37.02it/s, loss=0.0963]
+Test Epoch 35 ==> 	accuracy: 0.9547, 	precision: 0.9856, 	recall: 0.7793, 	specificity: 0.9972, 	f1: 0.8704, 	loss0.4780
+Train Epoch 36: 100%|██████████| 6137/6137 [06:52<00:00, 14.87it/s, loss=0.0625]
+Train Epoch 36 ==> 	accuracy: 0.8655, 	precision: 0.9994, 	recall: 0.7314, 	specificity: 0.9995, 	f1: 0.8447,	 loss0.5674
+Test Epoch 36: 100%|██████████| 1748/1748 [00:44<00:00, 39.52it/s, loss=0.16]
+Test Epoch 36 ==> 	accuracy: 0.9561, 	precision: 0.9823, 	recall: 0.7895, 	specificity: 0.9966, 	f1: 0.8754, 	loss0.5570
+Train Epoch 37: 100%|██████████| 6137/6137 [07:09<00:00, 14.31it/s, loss=0.0275]
+Train Epoch 37 ==> 	accuracy: 0.8657, 	precision: 0.9994, 	recall: 0.7318, 	specificity: 0.9996, 	f1: 0.8450,	 loss0.5655
+Test Epoch 37: 100%|██████████| 1748/1748 [00:45<00:00, 38.12it/s, loss=0.413]
+Test Epoch 37 ==> 	accuracy: 0.9519, 	precision: 0.9779, 	recall: 0.7710, 	specificity: 0.9958, 	f1: 0.8622, 	loss0.6403
+Train Epoch 38: 100%|██████████| 6137/6137 [06:58<00:00, 14.67it/s, loss=0.0913]
+Train Epoch 38 ==> 	accuracy: 0.8674, 	precision: 0.9994, 	recall: 0.7351, 	specificity: 0.9996, 	f1: 0.8471,	 loss0.5623
+Test Epoch 38: 100%|██████████| 1748/1748 [00:45<00:00, 38.02it/s, loss=0.787]
+Test Epoch 38 ==> 	accuracy: 0.9542, 	precision: 0.9839, 	recall: 0.7778, 	specificity: 0.9969, 	f1: 0.8688, 	loss0.5708
+Train Epoch 39: 100%|██████████| 6137/6137 [07:02<00:00, 14.52it/s, loss=0.0238]
+Train Epoch 39 ==> 	accuracy: 0.8679, 	precision: 0.9994, 	recall: 0.7362, 	specificity: 0.9996, 	f1: 0.8479,	 loss0.5547
+Test Epoch 39: 100%|██████████| 1748/1748 [00:42<00:00, 41.49it/s, loss=0.145]
+Test Epoch 39 ==> 	accuracy: 0.9524, 	precision: 0.9796, 	recall: 0.7720, 	specificity: 0.9961, 	f1: 0.8635, 	loss0.6161
+Train Epoch 40: 100%|██████████| 6137/6137 [06:39<00:00, 15.37it/s, loss=0.283]
+Train Epoch 40 ==> 	accuracy: 0.8684, 	precision: 0.9994, 	recall: 0.7372, 	specificity: 0.9996, 	f1: 0.8485,	 loss0.3344
+Test Epoch 40: 100%|██████████| 1748/1748 [00:42<00:00, 40.79it/s, loss=0.272]
+Test Epoch 40 ==> 	accuracy: 0.9550, 	precision: 0.9722, 	recall: 0.7921, 	specificity: 0.9945, 	f1: 0.8730, 	loss0.6704
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 41: 100%|██████████| 6137/6137 [06:36<00:00, 15.49it/s, loss=0.0138]
+Train Epoch 41 ==> 	accuracy: 0.8674, 	precision: 0.9994, 	recall: 0.7353, 	specificity: 0.9995, 	f1: 0.8472,	 loss0.3406
+Test Epoch 41: 100%|██████████| 1748/1748 [00:46<00:00, 37.58it/s, loss=0.583]
+Test Epoch 41 ==> 	accuracy: 0.9556, 	precision: 0.9860, 	recall: 0.7837, 	specificity: 0.9973, 	f1: 0.8733, 	loss0.4740
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 42: 100%|██████████| 6137/6137 [06:47<00:00, 15.05it/s, loss=0.0066]
+Train Epoch 42 ==> 	accuracy: 0.8705, 	precision: 0.9994, 	recall: 0.7415, 	specificity: 0.9995, 	f1: 0.8513,	 loss0.3298
+Test Epoch 42: 100%|██████████| 1748/1748 [00:47<00:00, 36.65it/s, loss=0.306]
+Test Epoch 42 ==> 	accuracy: 0.9577, 	precision: 0.9765, 	recall: 0.8023, 	specificity: 0.9953, 	f1: 0.8809, 	loss0.6772
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 43: 100%|██████████| 6137/6137 [06:54<00:00, 14.82it/s, loss=0.0058]
+Train Epoch 43 ==> 	accuracy: 0.8702, 	precision: 0.9994, 	recall: 0.7408, 	specificity: 0.9996, 	f1: 0.8509,	 loss0.3291
+Test Epoch 43: 100%|██████████| 1748/1748 [00:42<00:00, 41.08it/s, loss=0.221]
+Test Epoch 43 ==> 	accuracy: 0.9558, 	precision: 0.9857, 	recall: 0.7851, 	specificity: 0.9972, 	f1: 0.8740, 	loss0.5114
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 44: 100%|██████████| 6137/6137 [06:52<00:00, 14.87it/s, loss=0.0186]
+Train Epoch 44 ==> 	accuracy: 0.8739, 	precision: 0.9994, 	recall: 0.7483, 	specificity: 0.9996, 	f1: 0.8558,	 loss0.3207
+Test Epoch 44: 100%|██████████| 1748/1748 [00:45<00:00, 38.65it/s, loss=0.261]
+Test Epoch 44 ==> 	accuracy: 0.9554, 	precision: 0.9823, 	recall: 0.7856, 	specificity: 0.9966, 	f1: 0.8730, 	loss0.5966
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 45: 100%|██████████| 6137/6137 [06:55<00:00, 14.76it/s, loss=0.0336]
+Train Epoch 45 ==> 	accuracy: 0.8710, 	precision: 0.9994, 	recall: 0.7425, 	specificity: 0.9996, 	f1: 0.8520,	 loss0.3308
+Test Epoch 45: 100%|██████████| 1748/1748 [00:43<00:00, 39.73it/s, loss=0.111]
+Test Epoch 45 ==> 	accuracy: 0.9565, 	precision: 0.9822, 	recall: 0.7913, 	specificity: 0.9965, 	f1: 0.8765, 	loss0.5850
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 46: 100%|██████████| 6137/6137 [06:39<00:00, 15.36it/s, loss=0.0271]
+Train Epoch 46 ==> 	accuracy: 0.8759, 	precision: 0.9995, 	recall: 0.7522, 	specificity: 0.9996, 	f1: 0.8584,	 loss0.3148
+Test Epoch 46: 100%|██████████| 1748/1748 [00:46<00:00, 37.51it/s, loss=0.501]
+Test Epoch 46 ==> 	accuracy: 0.9581, 	precision: 0.9808, 	recall: 0.8012, 	specificity: 0.9962, 	f1: 0.8819, 	loss0.6614
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 47: 100%|██████████| 6137/6137 [06:40<00:00, 15.31it/s, loss=0.0321]
+Train Epoch 47 ==> 	accuracy: 0.8735, 	precision: 0.9995, 	recall: 0.7473, 	specificity: 0.9996, 	f1: 0.8552,	 loss0.3261
+Test Epoch 47: 100%|██████████| 1748/1748 [00:42<00:00, 41.18it/s, loss=0.0408]
+Test Epoch 47 ==> 	accuracy: 0.9564, 	precision: 0.9916, 	recall: 0.7834, 	specificity: 0.9984, 	f1: 0.8753, 	loss0.3544
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 48: 100%|██████████| 6137/6137 [06:42<00:00, 15.25it/s, loss=0.0374]
+Train Epoch 48 ==> 	accuracy: 0.8763, 	precision: 0.9995, 	recall: 0.7529, 	specificity: 0.9996, 	f1: 0.8589,	 loss0.3138
+Test Epoch 48: 100%|██████████| 1748/1748 [00:42<00:00, 40.81it/s, loss=0.535]
+Test Epoch 48 ==> 	accuracy: 0.9577, 	precision: 0.9867, 	recall: 0.7938, 	specificity: 0.9974, 	f1: 0.8798, 	loss0.4640
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 49: 100%|██████████| 6137/6137 [07:00<00:00, 14.58it/s, loss=0.0215]
+Train Epoch 49 ==> 	accuracy: 0.8751, 	precision: 0.9995, 	recall: 0.7507, 	specificity: 0.9996, 	f1: 0.8574,	 loss0.3267
+Test Epoch 49: 100%|██████████| 1748/1748 [00:45<00:00, 38.61it/s, loss=0.436]
+Test Epoch 49 ==> 	accuracy: 0.9592, 	precision: 0.9900, 	recall: 0.7991, 	specificity: 0.9980, 	f1: 0.8843, 	loss0.3976
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 50: 100%|██████████| 6137/6137 [06:37<00:00, 15.45it/s, loss=0.0085]
+Train Epoch 50 ==> 	accuracy: 0.8786, 	precision: 0.9995, 	recall: 0.7576, 	specificity: 0.9996, 	f1: 0.8619,	 loss0.3046
+Test Epoch 50: 100%|██████████| 1748/1748 [00:43<00:00, 40.35it/s, loss=0.692]
+Test Epoch 50 ==> 	accuracy: 0.9601, 	precision: 0.9837, 	recall: 0.8091, 	specificity: 0.9968, 	f1: 0.8879, 	loss0.5765
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 51: 100%|██████████| 6137/6137 [06:41<00:00, 15.28it/s, loss=0.0247]
+Train Epoch 51 ==> 	accuracy: 0.8775, 	precision: 0.9995, 	recall: 0.7554, 	specificity: 0.9996, 	f1: 0.8605,	 loss0.3202
+Test Epoch 51: 100%|██████████| 1748/1748 [00:44<00:00, 38.86it/s, loss=0.134]
+Test Epoch 51 ==> 	accuracy: 0.9600, 	precision: 0.9881, 	recall: 0.8048, 	specificity: 0.9976, 	f1: 0.8871, 	loss0.4301
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 52: 100%|██████████| 6137/6137 [06:43<00:00, 15.19it/s, loss=0.0159]
+Train Epoch 52 ==> 	accuracy: 0.8815, 	precision: 0.9995, 	recall: 0.7633, 	specificity: 0.9996, 	f1: 0.8656,	 loss0.3019
+Test Epoch 52: 100%|██████████| 1748/1748 [00:43<00:00, 40.19it/s, loss=0.0717]
+Test Epoch 52 ==> 	accuracy: 0.9605, 	precision: 0.9834, 	recall: 0.8114, 	specificity: 0.9967, 	f1: 0.8892, 	loss0.5907
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 53: 100%|██████████| 6137/6137 [06:35<00:00, 15.52it/s, loss=0.0188]
+Train Epoch 53 ==> 	accuracy: 0.8799, 	precision: 0.9995, 	recall: 0.7602, 	specificity: 0.9997, 	f1: 0.8636,	 loss0.3112
+Test Epoch 53: 100%|██████████| 1748/1748 [00:47<00:00, 37.00it/s, loss=0.0425]
+Test Epoch 53 ==> 	accuracy: 0.9596, 	precision: 0.9868, 	recall: 0.8035, 	specificity: 0.9974, 	f1: 0.8857, 	loss0.4790
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 54: 100%|██████████| 6137/6137 [06:31<00:00, 15.68it/s, loss=0.0155]
+Train Epoch 54 ==> 	accuracy: 0.8808, 	precision: 0.9995, 	recall: 0.7619, 	specificity: 0.9996, 	f1: 0.8647,	 loss0.3038
+Test Epoch 54: 100%|██████████| 1748/1748 [00:42<00:00, 41.23it/s, loss=0.273]
+Test Epoch 54 ==> 	accuracy: 0.9584, 	precision: 0.9821, 	recall: 0.8014, 	specificity: 0.9965, 	f1: 0.8826, 	loss0.6641
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 55: 100%|██████████| 6137/6137 [06:35<00:00, 15.52it/s, loss=0.007]
+Train Epoch 55 ==> 	accuracy: 0.8830, 	precision: 0.9996, 	recall: 0.7663, 	specificity: 0.9997, 	f1: 0.8675,	 loss0.3025
+Test Epoch 55: 100%|██████████| 1748/1748 [00:40<00:00, 43.56it/s, loss=0.0799]
+Test Epoch 55 ==> 	accuracy: 0.9612, 	precision: 0.9851, 	recall: 0.8134, 	specificity: 0.9970, 	f1: 0.8910, 	loss0.5506
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 56: 100%|██████████| 6137/6137 [06:29<00:00, 15.75it/s, loss=0.0211]
+Train Epoch 56 ==> 	accuracy: 0.8841, 	precision: 0.9996, 	recall: 0.7684, 	specificity: 0.9997, 	f1: 0.8689,	 loss0.3015
+Test Epoch 56: 100%|██████████| 1748/1748 [00:44<00:00, 39.64it/s, loss=0.0988]
+Test Epoch 56 ==> 	accuracy: 0.9618, 	precision: 0.9759, 	recall: 0.8245, 	specificity: 0.9951, 	f1: 0.8938, 	loss0.9670
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 57: 100%|██████████| 6137/6137 [06:31<00:00, 15.66it/s, loss=0.0067]
+Train Epoch 57 ==> 	accuracy: 0.8845, 	precision: 0.9996, 	recall: 0.7694, 	specificity: 0.9997, 	f1: 0.8695,	 loss0.2951
+Test Epoch 57: 100%|██████████| 1748/1748 [00:45<00:00, 38.62it/s, loss=0.0637]
+Test Epoch 57 ==> 	accuracy: 0.9619, 	precision: 0.9827, 	recall: 0.8192, 	specificity: 0.9965, 	f1: 0.8935, 	loss0.6494
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 58: 100%|██████████| 6137/6137 [06:19<00:00, 16.19it/s, loss=0.0037]
+Train Epoch 58 ==> 	accuracy: 0.8826, 	precision: 0.9995, 	recall: 0.7655, 	specificity: 0.9997, 	f1: 0.8670,	 loss0.3043
+Test Epoch 58: 100%|██████████| 1748/1748 [00:47<00:00, 37.07it/s, loss=0.0911]
+Test Epoch 58 ==> 	accuracy: 0.9579, 	precision: 0.9840, 	recall: 0.7972, 	specificity: 0.9969, 	f1: 0.8808, 	loss0.6335
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 59: 100%|██████████| 6137/6137 [06:27<00:00, 15.85it/s, loss=0.022]
+Train Epoch 59 ==> 	accuracy: 0.8852, 	precision: 0.9996, 	recall: 0.7707, 	specificity: 0.9997, 	f1: 0.8703,	 loss0.2985
+Test Epoch 59: 100%|██████████| 1748/1748 [00:41<00:00, 42.57it/s, loss=0.208]
+Test Epoch 59 ==> 	accuracy: 0.9600, 	precision: 0.9834, 	recall: 0.8086, 	specificity: 0.9967, 	f1: 0.8875, 	loss0.5739
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 60: 100%|██████████| 6137/6137 [06:34<00:00, 15.56it/s, loss=0.022]
+Train Epoch 60 ==> 	accuracy: 0.8874, 	precision: 0.9996, 	recall: 0.7752, 	specificity: 0.9997, 	f1: 0.8732,	 loss0.2949
+Test Epoch 60: 100%|██████████| 1748/1748 [00:43<00:00, 40.23it/s, loss=0.318]
+Test Epoch 60 ==> 	accuracy: 0.9610, 	precision: 0.9769, 	recall: 0.8194, 	specificity: 0.9953, 	f1: 0.8913, 	loss0.7530
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 61: 100%|██████████| 6137/6137 [06:35<00:00, 15.53it/s, loss=0.007]
+Train Epoch 61 ==> 	accuracy: 0.8882, 	precision: 0.9996, 	recall: 0.7768, 	specificity: 0.9997, 	f1: 0.8742,	 loss0.2906
+Test Epoch 61: 100%|██████████| 1748/1748 [00:39<00:00, 44.66it/s, loss=0.031]
+Test Epoch 61 ==> 	accuracy: 0.9617, 	precision: 0.9733, 	recall: 0.8264, 	specificity: 0.9945, 	f1: 0.8939, 	loss0.7716
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 62: 100%|██████████| 6137/6137 [06:18<00:00, 16.22it/s, loss=0.021]
+Train Epoch 62 ==> 	accuracy: 0.8868, 	precision: 0.9996, 	recall: 0.7740, 	specificity: 0.9997, 	f1: 0.8724,	 loss0.2931
+Test Epoch 62: 100%|██████████| 1748/1748 [00:42<00:00, 41.38it/s, loss=0.457]
+Test Epoch 62 ==> 	accuracy: 0.9621, 	precision: 0.9857, 	recall: 0.8175, 	specificity: 0.9971, 	f1: 0.8937, 	loss0.5592
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 63: 100%|██████████| 6137/6137 [06:25<00:00, 15.94it/s, loss=0.0167]
+Train Epoch 63 ==> 	accuracy: 0.8897, 	precision: 0.9996, 	recall: 0.7797, 	specificity: 0.9997, 	f1: 0.8761,	 loss0.2885
+Test Epoch 63: 100%|██████████| 1748/1748 [00:43<00:00, 40.31it/s, loss=0.194]
+Test Epoch 63 ==> 	accuracy: 0.9614, 	precision: 0.9848, 	recall: 0.8145, 	specificity: 0.9970, 	f1: 0.8916, 	loss0.5753
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 64: 100%|██████████| 6137/6137 [06:14<00:00, 16.37it/s, loss=0.0133]
+Train Epoch 64 ==> 	accuracy: 0.8888, 	precision: 0.9996, 	recall: 0.7779, 	specificity: 0.9997, 	f1: 0.8749,	 loss0.2907
+Test Epoch 64: 100%|██████████| 1748/1748 [00:41<00:00, 42.05it/s, loss=0.0939]
+Test Epoch 64 ==> 	accuracy: 0.9637, 	precision: 0.9818, 	recall: 0.8291, 	specificity: 0.9963, 	f1: 0.8991, 	loss0.6885
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 65: 100%|██████████| 6137/6137 [06:19<00:00, 16.18it/s, loss=0.0092]
+Train Epoch 65 ==> 	accuracy: 0.8912, 	precision: 0.9996, 	recall: 0.7826, 	specificity: 0.9997, 	f1: 0.8779,	 loss0.2840
+Test Epoch 65: 100%|██████████| 1748/1748 [00:38<00:00, 45.95it/s, loss=0.129]
+Test Epoch 65 ==> 	accuracy: 0.9638, 	precision: 0.9842, 	recall: 0.8279, 	specificity: 0.9968, 	f1: 0.8993, 	loss0.6316
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 66: 100%|██████████| 6137/6137 [06:02<00:00, 16.95it/s, loss=0.0115]
+Train Epoch 66 ==> 	accuracy: 0.8891, 	precision: 0.9996, 	recall: 0.7786, 	specificity: 0.9997, 	f1: 0.8754,	 loss0.2884
+Test Epoch 66: 100%|██████████| 1748/1748 [00:42<00:00, 41.39it/s, loss=0.191]
+Test Epoch 66 ==> 	accuracy: 0.9631, 	precision: 0.9824, 	recall: 0.8259, 	specificity: 0.9964, 	f1: 0.8974, 	loss0.7597
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 67: 100%|██████████| 6137/6137 [06:24<00:00, 15.95it/s, loss=0.0025]
+Train Epoch 67 ==> 	accuracy: 0.8907, 	precision: 0.9996, 	recall: 0.7817, 	specificity: 0.9997, 	f1: 0.8774,	 loss0.2853
+Test Epoch 67: 100%|██████████| 1748/1748 [00:39<00:00, 44.75it/s, loss=0.626]
+Test Epoch 67 ==> 	accuracy: 0.9615, 	precision: 0.9866, 	recall: 0.8136, 	specificity: 0.9973, 	f1: 0.8918, 	loss0.5248
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 68: 100%|██████████| 6137/6137 [06:26<00:00, 15.88it/s, loss=0.0155]
+Train Epoch 68 ==> 	accuracy: 0.8929, 	precision: 0.9996, 	recall: 0.7861, 	specificity: 0.9997, 	f1: 0.8801,	 loss0.2801
+Test Epoch 68: 100%|██████████| 1748/1748 [00:43<00:00, 39.88it/s, loss=0.117]
+Test Epoch 68 ==> 	accuracy: 0.9644, 	precision: 0.9812, 	recall: 0.8337, 	specificity: 0.9961, 	f1: 0.9015, 	loss0.6906
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 69: 100%|██████████| 6137/6137 [06:26<00:00, 15.86it/s, loss=0.0153]
+Train Epoch 69 ==> 	accuracy: 0.8927, 	precision: 0.9997, 	recall: 0.7858, 	specificity: 0.9997, 	f1: 0.8799,	 loss0.2799
+Test Epoch 69: 100%|██████████| 1748/1748 [00:41<00:00, 42.09it/s, loss=1.41]
+Test Epoch 69 ==> 	accuracy: 0.9638, 	precision: 0.9816, 	recall: 0.8298, 	specificity: 0.9962, 	f1: 0.8994, 	loss0.6688
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 70: 100%|██████████| 6137/6137 [06:26<00:00, 15.90it/s, loss=0.0102]
+Train Epoch 70 ==> 	accuracy: 0.8922, 	precision: 0.9996, 	recall: 0.7848, 	specificity: 0.9997, 	f1: 0.8793,	 loss0.2816
+Test Epoch 70: 100%|██████████| 1748/1748 [00:45<00:00, 38.13it/s, loss=0.112]
+Test Epoch 70 ==> 	accuracy: 0.9641, 	precision: 0.9798, 	recall: 0.8332, 	specificity: 0.9958, 	f1: 0.9006, 	loss0.7536
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 71: 100%|██████████| 6137/6137 [06:28<00:00, 15.81it/s, loss=0.0035]
+Train Epoch 71 ==> 	accuracy: 0.8937, 	precision: 0.9997, 	recall: 0.7877, 	specificity: 0.9997, 	f1: 0.8811,	 loss0.2809
+Test Epoch 71: 100%|██████████| 1748/1748 [00:43<00:00, 40.42it/s, loss=0.0937]
+Test Epoch 71 ==> 	accuracy: 0.9645, 	precision: 0.9792, 	recall: 0.8358, 	specificity: 0.9957, 	f1: 0.9018, 	loss0.7698
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 72: 100%|██████████| 6137/6137 [06:24<00:00, 15.97it/s, loss=0.0107]
+Train Epoch 72 ==> 	accuracy: 0.8954, 	precision: 0.9996, 	recall: 0.7910, 	specificity: 0.9997, 	f1: 0.8832,	 loss0.2722
+Test Epoch 72: 100%|██████████| 1748/1748 [00:42<00:00, 40.77it/s, loss=0.0589]
+Test Epoch 72 ==> 	accuracy: 0.9656, 	precision: 0.9839, 	recall: 0.8371, 	specificity: 0.9967, 	f1: 0.9046, 	loss0.6016
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 73: 100%|██████████| 6137/6137 [06:14<00:00, 16.38it/s, loss=0.0231]
+Train Epoch 73 ==> 	accuracy: 0.8955, 	precision: 0.9996, 	recall: 0.7913, 	specificity: 0.9997, 	f1: 0.8833,	 loss0.2767
+Test Epoch 73: 100%|██████████| 1748/1748 [00:38<00:00, 45.96it/s, loss=0.633]
+Test Epoch 73 ==> 	accuracy: 0.9640, 	precision: 0.9834, 	recall: 0.8297, 	specificity: 0.9966, 	f1: 0.9001, 	loss0.6792
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 74: 100%|██████████| 6137/6137 [06:12<00:00, 16.50it/s, loss=0.0127]
+Train Epoch 74 ==> 	accuracy: 0.8959, 	precision: 0.9996, 	recall: 0.7921, 	specificity: 0.9997, 	f1: 0.8838,	 loss0.2701
+Test Epoch 74: 100%|██████████| 1748/1748 [00:36<00:00, 47.63it/s, loss=0.414]
+Test Epoch 74 ==> 	accuracy: 0.9647, 	precision: 0.9841, 	recall: 0.8325, 	specificity: 0.9967, 	f1: 0.9020, 	loss0.5666
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 75: 100%|██████████| 6137/6137 [06:17<00:00, 16.27it/s, loss=0.0145]
+Train Epoch 75 ==> 	accuracy: 0.8955, 	precision: 0.9996, 	recall: 0.7913, 	specificity: 0.9997, 	f1: 0.8833,	 loss0.2776
+Test Epoch 75: 100%|██████████| 1748/1748 [00:44<00:00, 39.02it/s, loss=0.147]
+Test Epoch 75 ==> 	accuracy: 0.9647, 	precision: 0.9792, 	recall: 0.8370, 	specificity: 0.9957, 	f1: 0.9025, 	loss0.8269
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 76: 100%|██████████| 6137/6137 [06:14<00:00, 16.38it/s, loss=0.0333]
+Train Epoch 76 ==> 	accuracy: 0.8968, 	precision: 0.9997, 	recall: 0.7939, 	specificity: 0.9997, 	f1: 0.8850,	 loss0.2680
+Test Epoch 76: 100%|██████████| 1748/1748 [00:42<00:00, 40.82it/s, loss=0.218]
+Test Epoch 76 ==> 	accuracy: 0.9652, 	precision: 0.9807, 	recall: 0.8384, 	specificity: 0.9960, 	f1: 0.9040, 	loss0.7338
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 77: 100%|██████████| 6137/6137 [06:10<00:00, 16.57it/s, loss=0.0135]
+Train Epoch 77 ==> 	accuracy: 0.8970, 	precision: 0.9996, 	recall: 0.7942, 	specificity: 0.9997, 	f1: 0.8852,	 loss0.2718
+Test Epoch 77: 100%|██████████| 1748/1748 [00:37<00:00, 46.56it/s, loss=0.107]
+Test Epoch 77 ==> 	accuracy: 0.9655, 	precision: 0.9774, 	recall: 0.8427, 	specificity: 0.9953, 	f1: 0.9051, 	loss0.8637
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 78: 100%|██████████| 6137/6137 [06:00<00:00, 17.01it/s, loss=0.0176]
+Train Epoch 78 ==> 	accuracy: 0.8975, 	precision: 0.9996, 	recall: 0.7953, 	specificity: 0.9997, 	f1: 0.8858,	 loss0.2704
+Test Epoch 78: 100%|██████████| 1748/1748 [00:37<00:00, 46.31it/s, loss=0.0402]
+Test Epoch 78 ==> 	accuracy: 0.9653, 	precision: 0.9800, 	recall: 0.8392, 	specificity: 0.9958, 	f1: 0.9042, 	loss0.7402
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 79: 100%|██████████| 6137/6137 [05:56<00:00, 17.19it/s, loss=0.0203]
+Train Epoch 79 ==> 	accuracy: 0.8979, 	precision: 0.9997, 	recall: 0.7960, 	specificity: 0.9997, 	f1: 0.8863,	 loss0.2667
+Test Epoch 79: 100%|██████████| 1748/1748 [00:36<00:00, 48.02it/s, loss=0.251]
+Test Epoch 79 ==> 	accuracy: 0.9662, 	precision: 0.9748, 	recall: 0.8489, 	specificity: 0.9947, 	f1: 0.9075, 	loss0.9798
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 80: 100%|██████████| 6137/6137 [06:02<00:00, 16.92it/s, loss=0.0129]
+Train Epoch 80 ==> 	accuracy: 0.8978, 	precision: 0.9997, 	recall: 0.7959, 	specificity: 0.9997, 	f1: 0.8862,	 loss0.2719
+Test Epoch 80: 100%|██████████| 1748/1748 [00:38<00:00, 45.25it/s, loss=2.03]
+Test Epoch 80 ==> 	accuracy: 0.9657, 	precision: 0.9792, 	recall: 0.8418, 	specificity: 0.9957, 	f1: 0.9053, 	loss0.7588
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 81: 100%|██████████| 6137/6137 [06:02<00:00, 16.93it/s, loss=0.0026]
+Train Epoch 81 ==> 	accuracy: 0.9016, 	precision: 0.9997, 	recall: 0.8035, 	specificity: 0.9997, 	f1: 0.8909,	 loss0.2566
+Test Epoch 81: 100%|██████████| 1748/1748 [00:38<00:00, 45.34it/s, loss=0.0684]
+Test Epoch 81 ==> 	accuracy: 0.9658, 	precision: 0.9768, 	recall: 0.8445, 	specificity: 0.9951, 	f1: 0.9059, 	loss0.7751
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 82: 100%|██████████| 6137/6137 [06:01<00:00, 16.99it/s, loss=0.0097]
+Train Epoch 82 ==> 	accuracy: 0.8994, 	precision: 0.9997, 	recall: 0.7991, 	specificity: 0.9997, 	f1: 0.8882,	 loss0.2701
+Test Epoch 82: 100%|██████████| 1748/1748 [00:37<00:00, 46.76it/s, loss=0.151]
+Test Epoch 82 ==> 	accuracy: 0.9668, 	precision: 0.9817, 	recall: 0.8458, 	specificity: 0.9962, 	f1: 0.9087, 	loss0.7237
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 83: 100%|██████████| 6137/6137 [05:44<00:00, 17.82it/s, loss=0.0006]
+Train Epoch 83 ==> 	accuracy: 0.9004, 	precision: 0.9997, 	recall: 0.8010, 	specificity: 0.9997, 	f1: 0.8894,	 loss0.2627
+Test Epoch 83: 100%|██████████| 1748/1748 [00:42<00:00, 41.33it/s, loss=2.88]
+Test Epoch 83 ==> 	accuracy: 0.9657, 	precision: 0.9766, 	recall: 0.8444, 	specificity: 0.9951, 	f1: 0.9057, 	loss0.8232
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 84: 100%|██████████| 6137/6137 [05:55<00:00, 17.25it/s, loss=0.0044]
+Train Epoch 84 ==> 	accuracy: 0.9001, 	precision: 0.9997, 	recall: 0.8004, 	specificity: 0.9997, 	f1: 0.8890,	 loss0.2683
+Test Epoch 84: 100%|██████████| 1748/1748 [00:35<00:00, 48.98it/s, loss=0.136]
+Test Epoch 84 ==> 	accuracy: 0.9660, 	precision: 0.9787, 	recall: 0.8439, 	specificity: 0.9956, 	f1: 0.9063, 	loss0.7787
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 85: 100%|██████████| 6137/6137 [06:04<00:00, 16.82it/s, loss=0.0158]
+Train Epoch 85 ==> 	accuracy: 0.9032, 	precision: 0.9997, 	recall: 0.8067, 	specificity: 0.9997, 	f1: 0.8928,	 loss0.2555
+Test Epoch 85: 100%|██████████| 1748/1748 [00:40<00:00, 42.96it/s, loss=0.955]
+Test Epoch 85 ==> 	accuracy: 0.9661, 	precision: 0.9763, 	recall: 0.8470, 	specificity: 0.9950, 	f1: 0.9070, 	loss0.9290
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 86: 100%|██████████| 6137/6137 [06:02<00:00, 16.94it/s, loss=0.0548]
+Train Epoch 86 ==> 	accuracy: 0.9020, 	precision: 0.9997, 	recall: 0.8042, 	specificity: 0.9998, 	f1: 0.8913,	 loss0.2607
+Test Epoch 86: 100%|██████████| 1748/1748 [00:37<00:00, 47.21it/s, loss=0.117]
+Test Epoch 86 ==> 	accuracy: 0.9670, 	precision: 0.9784, 	recall: 0.8499, 	specificity: 0.9955, 	f1: 0.9096, 	loss0.8370
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 87: 100%|██████████| 6137/6137 [06:06<00:00, 16.75it/s, loss=0.0078]
+Train Epoch 87 ==> 	accuracy: 0.9022, 	precision: 0.9996, 	recall: 0.8047, 	specificity: 0.9997, 	f1: 0.8916,	 loss0.2597
+Test Epoch 87: 100%|██████████| 1748/1748 [00:42<00:00, 41.58it/s, loss=0.272]
+Test Epoch 87 ==> 	accuracy: 0.9668, 	precision: 0.9781, 	recall: 0.8487, 	specificity: 0.9954, 	f1: 0.9088, 	loss0.8034
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 88: 100%|██████████| 6137/6137 [06:12<00:00, 16.50it/s, loss=0.0181]
+Train Epoch 88 ==> 	accuracy: 0.9024, 	precision: 0.9997, 	recall: 0.8052, 	specificity: 0.9997, 	f1: 0.8919,	 loss0.2600
+Test Epoch 88: 100%|██████████| 1748/1748 [00:39<00:00, 44.17it/s, loss=0.0818]
+Test Epoch 88 ==> 	accuracy: 0.9667, 	precision: 0.9746, 	recall: 0.8514, 	specificity: 0.9946, 	f1: 0.9088, 	loss0.9141
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 89: 100%|██████████| 6137/6137 [06:04<00:00, 16.82it/s, loss=0.0241]
+Train Epoch 89 ==> 	accuracy: 0.9047, 	precision: 0.9997, 	recall: 0.8096, 	specificity: 0.9998, 	f1: 0.8946,	 loss0.2526
+Test Epoch 89: 100%|██████████| 1748/1748 [00:37<00:00, 46.43it/s, loss=2.8]
+Test Epoch 89 ==> 	accuracy: 0.9666, 	precision: 0.9742, 	recall: 0.8511, 	specificity: 0.9945, 	f1: 0.9085, 	loss0.9548
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 90: 100%|██████████| 6137/6137 [06:10<00:00, 16.58it/s, loss=0.0232]
+Train Epoch 90 ==> 	accuracy: 0.9031, 	precision: 0.9997, 	recall: 0.8065, 	specificity: 0.9998, 	f1: 0.8928,	 loss0.2599
+Test Epoch 90: 100%|██████████| 1748/1748 [00:38<00:00, 45.45it/s, loss=0.998]
+Test Epoch 90 ==> 	accuracy: 0.9673, 	precision: 0.9748, 	recall: 0.8545, 	specificity: 0.9947, 	f1: 0.9107, 	loss0.8978
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 91: 100%|██████████| 6137/6137 [06:06<00:00, 16.72it/s, loss=0.024]
+Train Epoch 91 ==> 	accuracy: 0.9036, 	precision: 0.9997, 	recall: 0.8075, 	specificity: 0.9997, 	f1: 0.8934,	 loss0.2553
+Test Epoch 91: 100%|██████████| 1748/1748 [00:39<00:00, 44.53it/s, loss=0.216]
+Test Epoch 91 ==> 	accuracy: 0.9675, 	precision: 0.9750, 	recall: 0.8556, 	specificity: 0.9947, 	f1: 0.9114, 	loss0.9376
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 92: 100%|██████████| 6137/6137 [06:08<00:00, 16.67it/s, loss=0.0153]
+Train Epoch 92 ==> 	accuracy: 0.9038, 	precision: 0.9997, 	recall: 0.8078, 	specificity: 0.9998, 	f1: 0.8936,	 loss0.2580
+Test Epoch 92: 100%|██████████| 1748/1748 [00:39<00:00, 43.77it/s, loss=0.198]
+Test Epoch 92 ==> 	accuracy: 0.9674, 	precision: 0.9763, 	recall: 0.8536, 	specificity: 0.9950, 	f1: 0.9109, 	loss0.8896
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 93: 100%|██████████| 6137/6137 [06:14<00:00, 16.41it/s, loss=0.0178]
+Train Epoch 93 ==> 	accuracy: 0.9055, 	precision: 0.9997, 	recall: 0.8113, 	specificity: 0.9998, 	f1: 0.8957,	 loss0.2492
+Test Epoch 93: 100%|██████████| 1748/1748 [00:43<00:00, 40.13it/s, loss=0.401]
+Test Epoch 93 ==> 	accuracy: 0.9679, 	precision: 0.9772, 	recall: 0.8552, 	specificity: 0.9952, 	f1: 0.9122, 	loss0.8674
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 94: 100%|██████████| 6137/6137 [06:22<00:00, 16.05it/s, loss=0.0006]
+Train Epoch 94 ==> 	accuracy: 0.9053, 	precision: 0.9997, 	recall: 0.8108, 	specificity: 0.9998, 	f1: 0.8954,	 loss0.2538
+Test Epoch 94: 100%|██████████| 1748/1748 [00:39<00:00, 44.33it/s, loss=2.39]
+Test Epoch 94 ==> 	accuracy: 0.9672, 	precision: 0.9751, 	recall: 0.8538, 	specificity: 0.9947, 	f1: 0.9104, 	loss0.9374
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 95: 100%|██████████| 6137/6137 [06:03<00:00, 16.88it/s, loss=0.0133]
+Train Epoch 95 ==> 	accuracy: 0.9045, 	precision: 0.9997, 	recall: 0.8092, 	specificity: 0.9998, 	f1: 0.8944,	 loss0.2541
+Test Epoch 95: 100%|██████████| 1748/1748 [00:37<00:00, 46.33it/s, loss=1.15]
+Test Epoch 95 ==> 	accuracy: 0.9663, 	precision: 0.9782, 	recall: 0.8461, 	specificity: 0.9954, 	f1: 0.9074, 	loss0.8590
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 96: 100%|██████████| 6137/6137 [06:04<00:00, 16.83it/s, loss=0.0128]
+Train Epoch 96 ==> 	accuracy: 0.9054, 	precision: 0.9997, 	recall: 0.8111, 	specificity: 0.9997, 	f1: 0.8956,	 loss0.2504
+Test Epoch 96: 100%|██████████| 1748/1748 [00:39<00:00, 44.74it/s, loss=2.2]
+Test Epoch 96 ==> 	accuracy: 0.9681, 	precision: 0.9745, 	recall: 0.8588, 	specificity: 0.9946, 	f1: 0.9130, 	loss0.9594
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 97: 100%|██████████| 6137/6137 [06:16<00:00, 16.32it/s, loss=0.0386]
+Train Epoch 97 ==> 	accuracy: 0.9053, 	precision: 0.9997, 	recall: 0.8109, 	specificity: 0.9998, 	f1: 0.8955,	 loss0.2549
+Test Epoch 97: 100%|██████████| 1748/1748 [00:39<00:00, 44.73it/s, loss=0.0801]
+Test Epoch 97 ==> 	accuracy: 0.9672, 	precision: 0.9792, 	recall: 0.8499, 	specificity: 0.9956, 	f1: 0.9100, 	loss0.7945
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 98: 100%|██████████| 6137/6137 [05:51<00:00, 17.48it/s, loss=0.0125]
+Train Epoch 98 ==> 	accuracy: 0.9072, 	precision: 0.9997, 	recall: 0.8146, 	specificity: 0.9998, 	f1: 0.8977,	 loss0.2472
+Test Epoch 98: 100%|██████████| 1748/1748 [00:35<00:00, 49.26it/s, loss=0.501]
+Test Epoch 98 ==> 	accuracy: 0.9682, 	precision: 0.9751, 	recall: 0.8589, 	specificity: 0.9947, 	f1: 0.9133, 	loss0.9581
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 99: 100%|██████████| 6137/6137 [05:56<00:00, 17.24it/s, loss=0.0223]
+Train Epoch 99 ==> 	accuracy: 0.9050, 	precision: 0.9997, 	recall: 0.8102, 	specificity: 0.9997, 	f1: 0.8950,	 loss0.2578
+Test Epoch 99: 100%|██████████| 1748/1748 [00:40<00:00, 42.85it/s, loss=0.201]
+Test Epoch 99 ==> 	accuracy: 0.9670, 	precision: 0.9795, 	recall: 0.8485, 	specificity: 0.9957, 	f1: 0.9093, 	loss0.7975
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 100: 100%|██████████| 6137/6137 [06:06<00:00, 16.72it/s, loss=0.0158]
+Train Epoch 100 ==> 	accuracy: 0.9071, 	precision: 0.9997, 	recall: 0.8145, 	specificity: 0.9998, 	f1: 0.8977,	 loss0.2452
+Test Epoch 100: 100%|██████████| 1748/1748 [00:38<00:00, 45.03it/s, loss=0.133]
+Test Epoch 100 ==> 	accuracy: 0.9682, 	precision: 0.9782, 	recall: 0.8559, 	specificity: 0.9954, 	f1: 0.9130, 	loss0.8233
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 101: 100%|██████████| 6137/6137 [05:55<00:00, 17.26it/s, loss=0.0232]
+Train Epoch 101 ==> 	accuracy: 0.9060, 	precision: 0.9997, 	recall: 0.8122, 	specificity: 0.9998, 	f1: 0.8963,	 loss0.2546
+Test Epoch 101: 100%|██████████| 1748/1748 [00:40<00:00, 42.89it/s, loss=0.0591]
+Test Epoch 101 ==> 	accuracy: 0.9673, 	precision: 0.9744, 	recall: 0.8548, 	specificity: 0.9946, 	f1: 0.9107, 	loss0.9230
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 102: 100%|██████████| 6137/6137 [06:07<00:00, 16.70it/s, loss=0.0084]
+Train Epoch 102 ==> 	accuracy: 0.9082, 	precision: 0.9997, 	recall: 0.8167, 	specificity: 0.9998, 	f1: 0.8990,	 loss0.2462
+Test Epoch 102: 100%|██████████| 1748/1748 [00:38<00:00, 45.44it/s, loss=0.158]
+Test Epoch 102 ==> 	accuracy: 0.9677, 	precision: 0.9730, 	recall: 0.8582, 	specificity: 0.9942, 	f1: 0.9120, 	loss0.9688
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 103: 100%|██████████| 6137/6137 [05:56<00:00, 17.22it/s, loss=0.0062]
+Train Epoch 103 ==> 	accuracy: 0.9061, 	precision: 0.9997, 	recall: 0.8125, 	specificity: 0.9998, 	f1: 0.8964,	 loss0.2533
+Test Epoch 103: 100%|██████████| 1748/1748 [00:40<00:00, 43.23it/s, loss=0.101]
+Test Epoch 103 ==> 	accuracy: 0.9674, 	precision: 0.9799, 	recall: 0.8506, 	specificity: 0.9958, 	f1: 0.9107, 	loss0.7823
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 104: 100%|██████████| 6137/6137 [06:07<00:00, 16.69it/s, loss=0.0096]
+Train Epoch 104 ==> 	accuracy: 0.9089, 	precision: 0.9997, 	recall: 0.8181, 	specificity: 0.9998, 	f1: 0.8998,	 loss0.2442
+Test Epoch 104: 100%|██████████| 1748/1748 [00:39<00:00, 43.99it/s, loss=1.15]
+Test Epoch 104 ==> 	accuracy: 0.9676, 	precision: 0.9786, 	recall: 0.8526, 	specificity: 0.9955, 	f1: 0.9113, 	loss0.8926
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 105: 100%|██████████| 6137/6137 [06:06<00:00, 16.72it/s, loss=0.0097]
+Train Epoch 105 ==> 	accuracy: 0.9077, 	precision: 0.9997, 	recall: 0.8156, 	specificity: 0.9998, 	f1: 0.8983,	 loss0.2450
+Test Epoch 105: 100%|██████████| 1748/1748 [00:39<00:00, 43.78it/s, loss=0.293]
+Test Epoch 105 ==> 	accuracy: 0.9684, 	precision: 0.9777, 	recall: 0.8578, 	specificity: 0.9952, 	f1: 0.9138, 	loss0.9023
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 106: 100%|██████████| 6137/6137 [06:04<00:00, 16.86it/s, loss=0.0158]
+Train Epoch 106 ==> 	accuracy: 0.9085, 	precision: 0.9997, 	recall: 0.8172, 	specificity: 0.9998, 	f1: 0.8993,	 loss0.2488
+Test Epoch 106: 100%|██████████| 1748/1748 [00:39<00:00, 44.20it/s, loss=2.33]
+Test Epoch 106 ==> 	accuracy: 0.9681, 	precision: 0.9749, 	recall: 0.8589, 	specificity: 0.9946, 	f1: 0.9132, 	loss1.0031
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 107: 100%|██████████| 6137/6137 [06:07<00:00, 16.70it/s, loss=0.0034]
+Train Epoch 107 ==> 	accuracy: 0.9092, 	precision: 0.9997, 	recall: 0.8187, 	specificity: 0.9998, 	f1: 0.9002,	 loss0.2423
+Test Epoch 107: 100%|██████████| 1748/1748 [00:36<00:00, 47.88it/s, loss=0.502]
+Test Epoch 107 ==> 	accuracy: 0.9685, 	precision: 0.9755, 	recall: 0.8599, 	specificity: 0.9948, 	f1: 0.9141, 	loss0.9159
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 108: 100%|██████████| 6137/6137 [06:00<00:00, 17.04it/s, loss=0.0009]
+Train Epoch 108 ==> 	accuracy: 0.9081, 	precision: 0.9997, 	recall: 0.8164, 	specificity: 0.9998, 	f1: 0.8988,	 loss0.2484
+Test Epoch 108: 100%|██████████| 1748/1748 [00:40<00:00, 43.28it/s, loss=0.146]
+Test Epoch 108 ==> 	accuracy: 0.9685, 	precision: 0.9743, 	recall: 0.8612, 	specificity: 0.9945, 	f1: 0.9143, 	loss1.0036
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 109: 100%|██████████| 6137/6137 [06:07<00:00, 16.70it/s, loss=0.0092]
+Train Epoch 109 ==> 	accuracy: 0.9107, 	precision: 0.9997, 	recall: 0.8216, 	specificity: 0.9998, 	f1: 0.9019,	 loss0.2398
+Test Epoch 109: 100%|██████████| 1748/1748 [00:38<00:00, 45.60it/s, loss=0.412]
+Test Epoch 109 ==> 	accuracy: 0.9692, 	precision: 0.9740, 	recall: 0.8651, 	specificity: 0.9944, 	f1: 0.9163, 	loss1.0540
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 110: 100%|██████████| 6137/6137 [06:09<00:00, 16.59it/s, loss=0.0236]
+Train Epoch 110 ==> 	accuracy: 0.9088, 	precision: 0.9997, 	recall: 0.8178, 	specificity: 0.9998, 	f1: 0.8997,	 loss0.2467
+Test Epoch 110: 100%|██████████| 1748/1748 [00:37<00:00, 46.10it/s, loss=0.164]
+Test Epoch 110 ==> 	accuracy: 0.9681, 	precision: 0.9721, 	recall: 0.8613, 	specificity: 0.9940, 	f1: 0.9133, 	loss1.0956
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 111: 100%|██████████| 6137/6137 [06:10<00:00, 16.58it/s, loss=0.0042]
+Train Epoch 111 ==> 	accuracy: 0.9101, 	precision: 0.9997, 	recall: 0.8205, 	specificity: 0.9998, 	f1: 0.9013,	 loss0.2400
+Test Epoch 111: 100%|██████████| 1748/1748 [00:40<00:00, 43.27it/s, loss=0.0568]
+Test Epoch 111 ==> 	accuracy: 0.9685, 	precision: 0.9759, 	recall: 0.8598, 	specificity: 0.9949, 	f1: 0.9142, 	loss0.9004
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 112: 100%|██████████| 6137/6137 [06:03<00:00, 16.90it/s, loss=0.0004]
+Train Epoch 112 ==> 	accuracy: 0.9095, 	precision: 0.9997, 	recall: 0.8192, 	specificity: 0.9998, 	f1: 0.9005,	 loss0.2434
+Test Epoch 112: 100%|██████████| 1748/1748 [00:40<00:00, 42.75it/s, loss=1.1]
+Test Epoch 112 ==> 	accuracy: 0.9686, 	precision: 0.9694, 	recall: 0.8663, 	specificity: 0.9934, 	f1: 0.9149, 	loss1.1692
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 113: 100%|██████████| 6137/6137 [06:06<00:00, 16.75it/s, loss=0.013]
+Train Epoch 113 ==> 	accuracy: 0.9104, 	precision: 0.9997, 	recall: 0.8210, 	specificity: 0.9998, 	f1: 0.9016,	 loss0.2426
+Test Epoch 113: 100%|██████████| 1748/1748 [00:38<00:00, 45.70it/s, loss=2.79]
+Test Epoch 113 ==> 	accuracy: 0.9693, 	precision: 0.9733, 	recall: 0.8662, 	specificity: 0.9942, 	f1: 0.9166, 	loss1.0668
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 114: 100%|██████████| 6137/6137 [06:06<00:00, 16.73it/s, loss=0.0055]
+Train Epoch 114 ==> 	accuracy: 0.9106, 	precision: 0.9997, 	recall: 0.8215, 	specificity: 0.9998, 	f1: 0.9019,	 loss0.2415
+Test Epoch 114: 100%|██████████| 1748/1748 [00:40<00:00, 42.86it/s, loss=0.0657]
+Test Epoch 114 ==> 	accuracy: 0.9685, 	precision: 0.9704, 	recall: 0.8651, 	specificity: 0.9936, 	f1: 0.9147, 	loss1.1698
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 115: 100%|██████████| 6137/6137 [06:02<00:00, 16.91it/s, loss=0.034]
+Train Epoch 115 ==> 	accuracy: 0.9119, 	precision: 0.9997, 	recall: 0.8240, 	specificity: 0.9998, 	f1: 0.9034,	 loss0.2352
+Test Epoch 115: 100%|██████████| 1748/1748 [00:38<00:00, 44.98it/s, loss=1.84]
+Test Epoch 115 ==> 	accuracy: 0.9691, 	precision: 0.9718, 	recall: 0.8669, 	specificity: 0.9939, 	f1: 0.9164, 	loss1.0902
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 116: 100%|██████████| 6137/6137 [06:07<00:00, 16.69it/s, loss=0.0043]
+Train Epoch 116 ==> 	accuracy: 0.9099, 	precision: 0.9997, 	recall: 0.8200, 	specificity: 0.9998, 	f1: 0.9010,	 loss0.2456
+Test Epoch 116: 100%|██████████| 1748/1748 [00:38<00:00, 45.68it/s, loss=0.183]
+Test Epoch 116 ==> 	accuracy: 0.9685, 	precision: 0.9727, 	recall: 0.8628, 	specificity: 0.9941, 	f1: 0.9145, 	loss1.0297
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 117: 100%|██████████| 6137/6137 [06:09<00:00, 16.59it/s, loss=0.0062]
+Train Epoch 117 ==> 	accuracy: 0.9115, 	precision: 0.9997, 	recall: 0.8233, 	specificity: 0.9998, 	f1: 0.9030,	 loss0.2391
+Test Epoch 117: 100%|██████████| 1748/1748 [00:43<00:00, 40.31it/s, loss=0.223]
+Test Epoch 117 ==> 	accuracy: 0.9689, 	precision: 0.9729, 	recall: 0.8647, 	specificity: 0.9942, 	f1: 0.9156, 	loss1.0026
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 118: 100%|██████████| 6137/6137 [06:15<00:00, 16.33it/s, loss=0.003]
+Train Epoch 118 ==> 	accuracy: 0.9115, 	precision: 0.9997, 	recall: 0.8232, 	specificity: 0.9998, 	f1: 0.9029,	 loss0.2392
+Test Epoch 118: 100%|██████████| 1748/1748 [00:37<00:00, 47.11it/s, loss=0.12]
+Test Epoch 118 ==> 	accuracy: 0.9685, 	precision: 0.9736, 	recall: 0.8620, 	specificity: 0.9943, 	f1: 0.9144, 	loss1.0058
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 119: 100%|██████████| 6137/6137 [05:57<00:00, 17.15it/s, loss=0.0122]
+Train Epoch 119 ==> 	accuracy: 0.9099, 	precision: 0.9997, 	recall: 0.8200, 	specificity: 0.9998, 	f1: 0.9010,	 loss0.2429
+Test Epoch 119: 100%|██████████| 1748/1748 [00:37<00:00, 46.11it/s, loss=0.342]
+Test Epoch 119 ==> 	accuracy: 0.9704, 	precision: 0.9780, 	recall: 0.8678, 	specificity: 0.9953, 	f1: 0.9196, 	loss0.9014
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 120: 100%|██████████| 6137/6137 [06:04<00:00, 16.83it/s, loss=0.736]
+Train Epoch 120 ==> 	accuracy: 0.9108, 	precision: 0.9997, 	recall: 0.8219, 	specificity: 0.9998, 	f1: 0.9021,	 loss0.2418
+Test Epoch 120: 100%|██████████| 1748/1748 [00:38<00:00, 45.80it/s, loss=0.048]
+Test Epoch 120 ==> 	accuracy: 0.9696, 	precision: 0.9801, 	recall: 0.8618, 	specificity: 0.9958, 	f1: 0.9171, 	loss0.8288
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 121: 100%|██████████| 6137/6137 [05:52<00:00, 17.41it/s, loss=0.0052]
+Train Epoch 121 ==> 	accuracy: 0.9103, 	precision: 0.9997, 	recall: 0.8209, 	specificity: 0.9998, 	f1: 0.9015,	 loss0.2457
+Test Epoch 121: 100%|██████████| 1748/1748 [00:39<00:00, 44.26it/s, loss=0.843]
+Test Epoch 121 ==> 	accuracy: 0.9703, 	precision: 0.9763, 	recall: 0.8688, 	specificity: 0.9949, 	f1: 0.9194, 	loss0.9883
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 122: 100%|██████████| 6137/6137 [06:07<00:00, 16.69it/s, loss=0.0174]
+Train Epoch 122 ==> 	accuracy: 0.9127, 	precision: 0.9997, 	recall: 0.8256, 	specificity: 0.9998, 	f1: 0.9043,	 loss0.2342
+Test Epoch 122: 100%|██████████| 1748/1748 [00:39<00:00, 44.01it/s, loss=0.369]
+Test Epoch 122 ==> 	accuracy: 0.9703, 	precision: 0.9760, 	recall: 0.8693, 	specificity: 0.9948, 	f1: 0.9196, 	loss0.9863
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 123: 100%|██████████| 6137/6137 [05:54<00:00, 17.33it/s, loss=0.0048]
+Train Epoch 123 ==> 	accuracy: 0.9107, 	precision: 0.9997, 	recall: 0.8216, 	specificity: 0.9998, 	f1: 0.9020,	 loss0.2454
+Test Epoch 123: 100%|██████████| 1748/1748 [00:38<00:00, 45.75it/s, loss=0.245]
+Test Epoch 123 ==> 	accuracy: 0.9702, 	precision: 0.9764, 	recall: 0.8684, 	specificity: 0.9949, 	f1: 0.9192, 	loss0.9860
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 124: 100%|██████████| 6137/6137 [06:04<00:00, 16.85it/s, loss=0.0241]
+Train Epoch 124 ==> 	accuracy: 0.9130, 	precision: 0.9997, 	recall: 0.8262, 	specificity: 0.9998, 	f1: 0.9047,	 loss0.2340
+Test Epoch 124: 100%|██████████| 1748/1748 [00:38<00:00, 45.32it/s, loss=0.144]
+Test Epoch 124 ==> 	accuracy: 0.9709, 	precision: 0.9767, 	recall: 0.8715, 	specificity: 0.9950, 	f1: 0.9211, 	loss1.0128
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 125: 100%|██████████| 6137/6137 [06:13<00:00, 16.43it/s, loss=0.0074]
+Train Epoch 125 ==> 	accuracy: 0.9104, 	precision: 0.9997, 	recall: 0.8210, 	specificity: 0.9998, 	f1: 0.9016,	 loss0.2470
+Test Epoch 125: 100%|██████████| 1748/1748 [00:39<00:00, 44.18it/s, loss=2.63]
+Test Epoch 125 ==> 	accuracy: 0.9702, 	precision: 0.9771, 	recall: 0.8678, 	specificity: 0.9951, 	f1: 0.9192, 	loss1.0025
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 126: 100%|██████████| 6137/6137 [06:01<00:00, 16.97it/s, loss=0.0067]
+Train Epoch 126 ==> 	accuracy: 0.9130, 	precision: 0.9997, 	recall: 0.8262, 	specificity: 0.9998, 	f1: 0.9047,	 loss0.2321
+Test Epoch 126: 100%|██████████| 1748/1748 [00:40<00:00, 42.82it/s, loss=0.101]
+Test Epoch 126 ==> 	accuracy: 0.9702, 	precision: 0.9768, 	recall: 0.8678, 	specificity: 0.9950, 	f1: 0.9191, 	loss1.0090
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 127: 100%|██████████| 6137/6137 [06:08<00:00, 16.65it/s, loss=0.0024]
+Train Epoch 127 ==> 	accuracy: 0.9120, 	precision: 0.9997, 	recall: 0.8242, 	specificity: 0.9998, 	f1: 0.9035,	 loss0.2404
+Test Epoch 127: 100%|██████████| 1748/1748 [00:37<00:00, 46.92it/s, loss=0.844]
+Test Epoch 127 ==> 	accuracy: 0.9699, 	precision: 0.9767, 	recall: 0.8665, 	specificity: 0.9950, 	f1: 0.9183, 	loss1.0101
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 128: 100%|██████████| 6137/6137 [06:09<00:00, 16.63it/s, loss=0.019]
+Train Epoch 128 ==> 	accuracy: 0.9137, 	precision: 0.9997, 	recall: 0.8276, 	specificity: 0.9998, 	f1: 0.9056,	 loss0.2326
+Test Epoch 128: 100%|██████████| 1748/1748 [00:39<00:00, 43.73it/s, loss=0.175]
+Test Epoch 128 ==> 	accuracy: 0.9707, 	precision: 0.9727, 	recall: 0.8741, 	specificity: 0.9941, 	f1: 0.9208, 	loss1.1967
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 129: 100%|██████████| 6137/6137 [05:58<00:00, 17.12it/s, loss=0.012]
+Train Epoch 129 ==> 	accuracy: 0.9120, 	precision: 0.9997, 	recall: 0.8243, 	specificity: 0.9998, 	f1: 0.9036,	 loss0.2414
+Test Epoch 129: 100%|██████████| 1748/1748 [00:41<00:00, 42.27it/s, loss=0.13]
+Test Epoch 129 ==> 	accuracy: 0.9696, 	precision: 0.9791, 	recall: 0.8624, 	specificity: 0.9955, 	f1: 0.9171, 	loss0.9154
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 130: 100%|██████████| 6137/6137 [06:02<00:00, 16.92it/s, loss=0.0086]
+Train Epoch 130 ==> 	accuracy: 0.9128, 	precision: 0.9997, 	recall: 0.8259, 	specificity: 0.9998, 	f1: 0.9045,	 loss0.2357
+Test Epoch 130: 100%|██████████| 1748/1748 [00:41<00:00, 41.97it/s, loss=1.51]
+Test Epoch 130 ==> 	accuracy: 0.9702, 	precision: 0.9765, 	recall: 0.8681, 	specificity: 0.9949, 	f1: 0.9191, 	loss0.9840
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 131: 100%|██████████| 6137/6137 [05:52<00:00, 17.39it/s, loss=0.0092]
+Train Epoch 131 ==> 	accuracy: 0.9136, 	precision: 0.9998, 	recall: 0.8274, 	specificity: 0.9998, 	f1: 0.9055,	 loss0.2351
+Test Epoch 131: 100%|██████████| 1748/1748 [00:39<00:00, 44.11it/s, loss=1.56]
+Test Epoch 131 ==> 	accuracy: 0.9701, 	precision: 0.9741, 	recall: 0.8697, 	specificity: 0.9944, 	f1: 0.9189, 	loss1.1014
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 132: 100%|██████████| 6137/6137 [06:05<00:00, 16.80it/s, loss=0.017]
+Train Epoch 132 ==> 	accuracy: 0.9125, 	precision: 0.9997, 	recall: 0.8252, 	specificity: 0.9998, 	f1: 0.9041,	 loss0.2389
+Test Epoch 132: 100%|██████████| 1748/1748 [00:42<00:00, 40.82it/s, loss=0.655]
+Test Epoch 132 ==> 	accuracy: 0.9700, 	precision: 0.9765, 	recall: 0.8674, 	specificity: 0.9949, 	f1: 0.9187, 	loss0.9841
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 133: 100%|██████████| 6137/6137 [06:15<00:00, 16.34it/s, loss=0.0008]
+Train Epoch 133 ==> 	accuracy: 0.9140, 	precision: 0.9997, 	recall: 0.8283, 	specificity: 0.9998, 	f1: 0.9060,	 loss0.2342
+Test Epoch 133: 100%|██████████| 1748/1748 [00:39<00:00, 44.62it/s, loss=0.0495]
+Test Epoch 133 ==> 	accuracy: 0.9708, 	precision: 0.9735, 	recall: 0.8744, 	specificity: 0.9942, 	f1: 0.9213, 	loss1.1240
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 134: 100%|██████████| 6137/6137 [06:28<00:00, 15.80it/s, loss=0.032]
+Train Epoch 134 ==> 	accuracy: 0.9131, 	precision: 0.9997, 	recall: 0.8264, 	specificity: 0.9998, 	f1: 0.9048,	 loss0.2370
+Test Epoch 134: 100%|██████████| 1748/1748 [00:42<00:00, 40.94it/s, loss=0.23]
+Test Epoch 134 ==> 	accuracy: 0.9694, 	precision: 0.9763, 	recall: 0.8644, 	specificity: 0.9949, 	f1: 0.9169, 	loss1.0215
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 135: 100%|██████████| 6137/6137 [06:28<00:00, 15.80it/s, loss=0.0152]
+Train Epoch 135 ==> 	accuracy: 0.9142, 	precision: 0.9997, 	recall: 0.8286, 	specificity: 0.9998, 	f1: 0.9061,	 loss0.2338
+Test Epoch 135: 100%|██████████| 1748/1748 [00:40<00:00, 43.16it/s, loss=0.129]
+Test Epoch 135 ==> 	accuracy: 0.9707, 	precision: 0.9725, 	recall: 0.8743, 	specificity: 0.9940, 	f1: 0.9208, 	loss1.1392
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 136: 100%|██████████| 6137/6137 [06:13<00:00, 16.41it/s, loss=0.0113]
+Train Epoch 136 ==> 	accuracy: 0.9136, 	precision: 0.9997, 	recall: 0.8275, 	specificity: 0.9998, 	f1: 0.9055,	 loss0.2357
+Test Epoch 136: 100%|██████████| 1748/1748 [00:41<00:00, 42.54it/s, loss=0.0918]
+Test Epoch 136 ==> 	accuracy: 0.9705, 	precision: 0.9719, 	recall: 0.8742, 	specificity: 0.9939, 	f1: 0.9205, 	loss1.1694
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 137: 100%|██████████| 6137/6137 [06:11<00:00, 16.52it/s, loss=0.011]
+Train Epoch 137 ==> 	accuracy: 0.9149, 	precision: 0.9997, 	recall: 0.8300, 	specificity: 0.9998, 	f1: 0.9070,	 loss0.2328
+Test Epoch 137: 100%|██████████| 1748/1748 [00:36<00:00, 47.73it/s, loss=0.0812]
+Test Epoch 137 ==> 	accuracy: 0.9707, 	precision: 0.9719, 	recall: 0.8751, 	specificity: 0.9939, 	f1: 0.9210, 	loss1.2102
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 138: 100%|██████████| 6137/6137 [06:11<00:00, 16.51it/s, loss=0.0072]
+Train Epoch 138 ==> 	accuracy: 0.9136, 	precision: 0.9997, 	recall: 0.8273, 	specificity: 0.9998, 	f1: 0.9054,	 loss0.2362
+Test Epoch 138: 100%|██████████| 1748/1748 [00:43<00:00, 40.38it/s, loss=2.36]
+Test Epoch 138 ==> 	accuracy: 0.9703, 	precision: 0.9747, 	recall: 0.8703, 	specificity: 0.9945, 	f1: 0.9196, 	loss1.0872
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 139: 100%|██████████| 6137/6137 [06:31<00:00, 15.67it/s, loss=0.0042]
+Train Epoch 139 ==> 	accuracy: 0.9149, 	precision: 0.9998, 	recall: 0.8301, 	specificity: 0.9998, 	f1: 0.9071,	 loss0.2319
+Test Epoch 139: 100%|██████████| 1748/1748 [00:40<00:00, 42.90it/s, loss=0.407]
+Test Epoch 139 ==> 	accuracy: 0.9708, 	precision: 0.9728, 	recall: 0.8750, 	specificity: 0.9941, 	f1: 0.9213, 	loss1.1792
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 140: 100%|██████████| 6137/6137 [06:18<00:00, 16.21it/s, loss=0.0014]
+Train Epoch 140 ==> 	accuracy: 0.9131, 	precision: 0.9997, 	recall: 0.8265, 	specificity: 0.9998, 	f1: 0.9049,	 loss0.2393
+Test Epoch 140: 100%|██████████| 1748/1748 [00:44<00:00, 39.71it/s, loss=1.3]
+Test Epoch 140 ==> 	accuracy: 0.9707, 	precision: 0.9758, 	recall: 0.8716, 	specificity: 0.9948, 	f1: 0.9208, 	loss1.0422
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 141: 100%|██████████| 6137/6137 [06:33<00:00, 15.59it/s, loss=0.0193]
+Train Epoch 141 ==> 	accuracy: 0.9144, 	precision: 0.9997, 	recall: 0.8289, 	specificity: 0.9998, 	f1: 0.9064,	 loss0.2326
+Test Epoch 141: 100%|██████████| 1748/1748 [00:40<00:00, 42.85it/s, loss=0.205]
+Test Epoch 141 ==> 	accuracy: 0.9704, 	precision: 0.9729, 	recall: 0.8725, 	specificity: 0.9941, 	f1: 0.9200, 	loss1.1902
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 142: 100%|██████████| 6137/6137 [06:32<00:00, 15.65it/s, loss=0.0029]
+Train Epoch 142 ==> 	accuracy: 0.9132, 	precision: 0.9997, 	recall: 0.8265, 	specificity: 0.9998, 	f1: 0.9049,	 loss0.2380
+Test Epoch 142: 100%|██████████| 1748/1748 [00:40<00:00, 43.34it/s, loss=0.0881]
+Test Epoch 142 ==> 	accuracy: 0.9708, 	precision: 0.9723, 	recall: 0.8751, 	specificity: 0.9940, 	f1: 0.9212, 	loss1.2067
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 143: 100%|██████████| 6137/6137 [06:33<00:00, 15.60it/s, loss=0.0134]
+Train Epoch 143 ==> 	accuracy: 0.9159, 	precision: 0.9998, 	recall: 0.8320, 	specificity: 0.9998, 	f1: 0.9082,	 loss0.2270
+Test Epoch 143: 100%|██████████| 1748/1748 [00:45<00:00, 38.43it/s, loss=0.845]
+Test Epoch 143 ==> 	accuracy: 0.9706, 	precision: 0.9718, 	recall: 0.8749, 	specificity: 0.9938, 	f1: 0.9208, 	loss1.2028
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 144: 100%|██████████| 6137/6137 [06:38<00:00, 15.41it/s, loss=0.0165]
+Train Epoch 144 ==> 	accuracy: 0.9144, 	precision: 0.9997, 	recall: 0.8290, 	specificity: 0.9998, 	f1: 0.9064,	 loss0.2354
+Test Epoch 144: 100%|██████████| 1748/1748 [00:42<00:00, 41.38it/s, loss=0.093]
+Test Epoch 144 ==> 	accuracy: 0.9709, 	precision: 0.9742, 	recall: 0.8742, 	specificity: 0.9944, 	f1: 0.9215, 	loss1.1228
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 145: 100%|██████████| 6137/6137 [06:35<00:00, 15.50it/s, loss=0.0068]
+Train Epoch 145 ==> 	accuracy: 0.9151, 	precision: 0.9997, 	recall: 0.8305, 	specificity: 0.9998, 	f1: 0.9073,	 loss0.2320
+Test Epoch 145: 100%|██████████| 1748/1748 [00:43<00:00, 40.27it/s, loss=0.0782]
+Test Epoch 145 ==> 	accuracy: 0.9707, 	precision: 0.9725, 	recall: 0.8746, 	specificity: 0.9940, 	f1: 0.9210, 	loss1.1770
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 146: 100%|██████████| 6137/6137 [06:25<00:00, 15.92it/s, loss=0.0009]
+Train Epoch 146 ==> 	accuracy: 0.9149, 	precision: 0.9997, 	recall: 0.8301, 	specificity: 0.9998, 	f1: 0.9071,	 loss0.2336
+Test Epoch 146: 100%|██████████| 1748/1748 [00:38<00:00, 44.98it/s, loss=0.194]
+Test Epoch 146 ==> 	accuracy: 0.9708, 	precision: 0.9734, 	recall: 0.8744, 	specificity: 0.9942, 	f1: 0.9212, 	loss1.1350
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 147: 100%|██████████| 6137/6137 [06:19<00:00, 16.16it/s, loss=0.001]
+Train Epoch 147 ==> 	accuracy: 0.9151, 	precision: 0.9997, 	recall: 0.8304, 	specificity: 0.9998, 	f1: 0.9072,	 loss0.2310
+Test Epoch 147: 100%|██████████| 1748/1748 [00:42<00:00, 40.98it/s, loss=0.18]
+Test Epoch 147 ==> 	accuracy: 0.9705, 	precision: 0.9723, 	recall: 0.8740, 	specificity: 0.9940, 	f1: 0.9205, 	loss1.1953
+Adjusting learning rate of group 0 to 5.8150e-06.
+Train Epoch 148: 100%|██████████| 6137/6137 [06:29<00:00, 15.74it/s, loss=0.0021]
+Train Epoch 148 ==> 	accuracy: 0.9154, 	precision: 0.9997, 	recall: 0.8309, 	specificity: 0.9998, 	f1: 0.9076,	 loss0.2301
+Test Epoch 148: 100%|██████████| 1748/1748 [00:44<00:00, 39.65it/s, loss=0.967]
+Test Epoch 148 ==> 	accuracy: 0.9708, 	precision: 0.9711, 	recall: 0.8767, 	specificity: 0.9937, 	f1: 0.9215, 	loss1.2228
+Adjusting learning rate of group 0 to 5.8150e-06.
+Train Epoch 149: 100%|██████████| 6137/6137 [06:34<00:00, 15.55it/s, loss=0.0062]
+Train Epoch 149 ==> 	accuracy: 0.9148, 	precision: 0.9998, 	recall: 0.8298, 	specificity: 0.9998, 	f1: 0.9069,	 loss0.2329
+Test Epoch 149: 100%|██████████| 1748/1748 [00:41<00:00, 41.66it/s, loss=3.34]
+Test Epoch 149 ==> 	accuracy: 0.9707, 	precision: 0.9708, 	recall: 0.8761, 	specificity: 0.9936, 	f1: 0.9210, 	loss1.2383
+Adjusting learning rate of group 0 to 5.8150e-06.
+
+进程已结束，退出代码为 0
+
+'''
+
+'''
+seq
+
+/home/bio/anaconda3/bin/python /home/bio/bio_seq/oxog/oxog/script/train.py 
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 0: 100%|██████████| 6137/6137 [07:18<00:00, 14.00it/s, loss=0.128]
+Train Epoch 0 ==> 	accuracy: 0.5663, 	precision: 0.9933, 	recall: 0.1336, 	specificity: 0.9991, 	f1: 0.2355,	 loss1.3111
+Test Epoch 0: 100%|██████████| 1748/1748 [00:50<00:00, 34.81it/s, loss=0.389]
+Test Epoch 0 ==> 	accuracy: 0.8834, 	precision: 0.9751, 	recall: 0.4129, 	specificity: 0.9974, 	f1: 0.5801, 	loss0.6591
+Train Epoch 1: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.147]
+Train Epoch 1 ==> 	accuracy: 0.6535, 	precision: 0.9965, 	recall: 0.3081, 	specificity: 0.9989, 	f1: 0.4707,	 loss1.0842
+Test Epoch 1: 100%|██████████| 1748/1748 [00:57<00:00, 30.35it/s, loss=0.204]
+Test Epoch 1 ==> 	accuracy: 0.8944, 	precision: 0.9903, 	recall: 0.4636, 	specificity: 0.9989, 	f1: 0.6315, 	loss0.4675
+Train Epoch 2: 100%|██████████| 6137/6137 [08:22<00:00, 12.22it/s, loss=0.271]
+Train Epoch 2 ==> 	accuracy: 0.6957, 	precision: 0.9970, 	recall: 0.3926, 	specificity: 0.9988, 	f1: 0.5634,	 loss0.9713
+Test Epoch 2: 100%|██████████| 1748/1748 [00:51<00:00, 33.66it/s, loss=0.256]
+Test Epoch 2 ==> 	accuracy: 0.8994, 	precision: 0.9888, 	recall: 0.4898, 	specificity: 0.9987, 	f1: 0.6551, 	loss0.5220
+Train Epoch 3: 100%|██████████| 6137/6137 [08:25<00:00, 12.14it/s, loss=0.15]
+Train Epoch 3 ==> 	accuracy: 0.7113, 	precision: 0.9976, 	recall: 0.4236, 	specificity: 0.9990, 	f1: 0.5947,	 loss0.9590
+Test Epoch 3: 100%|██████████| 1748/1748 [00:52<00:00, 33.21it/s, loss=0.311]
+Test Epoch 3 ==> 	accuracy: 0.9015, 	precision: 0.9923, 	recall: 0.4988, 	specificity: 0.9991, 	f1: 0.6639, 	loss0.4396
+Train Epoch 4: 100%|██████████| 6137/6137 [08:22<00:00, 12.22it/s, loss=0.158]
+Train Epoch 4 ==> 	accuracy: 0.7276, 	precision: 0.9979, 	recall: 0.4561, 	specificity: 0.9990, 	f1: 0.6260,	 loss0.9083
+Test Epoch 4: 100%|██████████| 1748/1748 [00:53<00:00, 32.97it/s, loss=0.292]
+Test Epoch 4 ==> 	accuracy: 0.9088, 	precision: 0.9910, 	recall: 0.5373, 	specificity: 0.9988, 	f1: 0.6968, 	loss0.4428
+Train Epoch 5: 100%|██████████| 6137/6137 [08:04<00:00, 12.68it/s, loss=0.214]
+Train Epoch 5 ==> 	accuracy: 0.7353, 	precision: 0.9980, 	recall: 0.4716, 	specificity: 0.9990, 	f1: 0.6405,	 loss0.9004
+Test Epoch 5: 100%|██████████| 1748/1748 [00:54<00:00, 32.14it/s, loss=0.167]
+Test Epoch 5 ==> 	accuracy: 0.8964, 	precision: 0.9933, 	recall: 0.4723, 	specificity: 0.9992, 	f1: 0.6402, 	loss0.4283
+Train Epoch 6: 100%|██████████| 6137/6137 [08:02<00:00, 12.71it/s, loss=0.175]
+Train Epoch 6 ==> 	accuracy: 0.7416, 	precision: 0.9981, 	recall: 0.4840, 	specificity: 0.9991, 	f1: 0.6519,	 loss0.8766
+Test Epoch 6: 100%|██████████| 1748/1748 [00:49<00:00, 35.16it/s, loss=0.188]
+Test Epoch 6 ==> 	accuracy: 0.9100, 	precision: 0.9914, 	recall: 0.5436, 	specificity: 0.9989, 	f1: 0.7021, 	loss0.4599
+Train Epoch 7: 100%|██████████| 6137/6137 [08:11<00:00, 12.48it/s, loss=0.11]
+Train Epoch 7 ==> 	accuracy: 0.7488, 	precision: 0.9983, 	recall: 0.4985, 	specificity: 0.9991, 	f1: 0.6650,	 loss0.8602
+Test Epoch 7: 100%|██████████| 1748/1748 [00:57<00:00, 30.41it/s, loss=0.205]
+Test Epoch 7 ==> 	accuracy: 0.9061, 	precision: 0.9932, 	recall: 0.5224, 	specificity: 0.9991, 	f1: 0.6847, 	loss0.4184
+Train Epoch 8: 100%|██████████| 6137/6137 [08:18<00:00, 12.31it/s, loss=0.148]
+Train Epoch 8 ==> 	accuracy: 0.7500, 	precision: 0.9984, 	recall: 0.5008, 	specificity: 0.9992, 	f1: 0.6671,	 loss0.8577
+Test Epoch 8: 100%|██████████| 1748/1748 [00:55<00:00, 31.48it/s, loss=0.195]
+Test Epoch 8 ==> 	accuracy: 0.9164, 	precision: 0.9909, 	recall: 0.5768, 	specificity: 0.9987, 	f1: 0.7292, 	loss0.4471
+Train Epoch 9: 100%|██████████| 6137/6137 [08:32<00:00, 11.97it/s, loss=0.128]
+Train Epoch 9 ==> 	accuracy: 0.7557, 	precision: 0.9984, 	recall: 0.5123, 	specificity: 0.9992, 	f1: 0.6771,	 loss0.8448
+Test Epoch 9: 100%|██████████| 1748/1748 [00:55<00:00, 31.74it/s, loss=0.168]
+Test Epoch 9 ==> 	accuracy: 0.9072, 	precision: 0.9932, 	recall: 0.5278, 	specificity: 0.9991, 	f1: 0.6893, 	loss0.4042
+Train Epoch 10: 100%|██████████| 6137/6137 [08:27<00:00, 12.09it/s, loss=0.174]
+Train Epoch 10 ==> 	accuracy: 0.7610, 	precision: 0.9985, 	recall: 0.5227, 	specificity: 0.9992, 	f1: 0.6862,	 loss0.8278
+Test Epoch 10: 100%|██████████| 1748/1748 [00:59<00:00, 29.36it/s, loss=0.274]
+Test Epoch 10 ==> 	accuracy: 0.9065, 	precision: 0.9946, 	recall: 0.5239, 	specificity: 0.9993, 	f1: 0.6863, 	loss0.4009
+Train Epoch 11: 100%|██████████| 6137/6137 [08:38<00:00, 11.84it/s, loss=0.142]
+Train Epoch 11 ==> 	accuracy: 0.7640, 	precision: 0.9986, 	recall: 0.5288, 	specificity: 0.9993, 	f1: 0.6914,	 loss0.8278
+Test Epoch 11: 100%|██████████| 1748/1748 [00:58<00:00, 29.80it/s, loss=0.212]
+Test Epoch 11 ==> 	accuracy: 0.9113, 	precision: 0.9943, 	recall: 0.5486, 	specificity: 0.9992, 	f1: 0.7071, 	loss0.3955
+Train Epoch 12: 100%|██████████| 6137/6137 [08:26<00:00, 12.12it/s, loss=0.105]
+Train Epoch 12 ==> 	accuracy: 0.7663, 	precision: 0.9986, 	recall: 0.5334, 	specificity: 0.9992, 	f1: 0.6953,	 loss0.8135
+Test Epoch 12: 100%|██████████| 1748/1748 [00:59<00:00, 29.48it/s, loss=0.153]
+Test Epoch 12 ==> 	accuracy: 0.9080, 	precision: 0.9938, 	recall: 0.5317, 	specificity: 0.9992, 	f1: 0.6927, 	loss0.3982
+Train Epoch 13: 100%|██████████| 6137/6137 [08:17<00:00, 12.33it/s, loss=0.143]
+Train Epoch 13 ==> 	accuracy: 0.7698, 	precision: 0.9987, 	recall: 0.5402, 	specificity: 0.9993, 	f1: 0.7012,	 loss0.8111
+Test Epoch 13: 100%|██████████| 1748/1748 [00:57<00:00, 30.52it/s, loss=0.135]
+Test Epoch 13 ==> 	accuracy: 0.9185, 	precision: 0.9879, 	recall: 0.5896, 	specificity: 0.9983, 	f1: 0.7385, 	loss0.4841
+Train Epoch 14: 100%|██████████| 6137/6137 [08:18<00:00, 12.32it/s, loss=0.0713]
+Train Epoch 14 ==> 	accuracy: 0.7764, 	precision: 0.9987, 	recall: 0.5535, 	specificity: 0.9993, 	f1: 0.7123,	 loss0.7866
+Test Epoch 14: 100%|██████████| 1748/1748 [00:57<00:00, 30.64it/s, loss=0.21]
+Test Epoch 14 ==> 	accuracy: 0.9139, 	precision: 0.9920, 	recall: 0.5634, 	specificity: 0.9989, 	f1: 0.7187, 	loss0.5100
+Train Epoch 15: 100%|██████████| 6137/6137 [08:47<00:00, 11.64it/s, loss=0.149]
+Train Epoch 15 ==> 	accuracy: 0.7729, 	precision: 0.9988, 	recall: 0.5465, 	specificity: 0.9993, 	f1: 0.7064,	 loss0.8044
+Test Epoch 15: 100%|██████████| 1748/1748 [00:56<00:00, 30.96it/s, loss=0.232]
+Test Epoch 15 ==> 	accuracy: 0.9198, 	precision: 0.9829, 	recall: 0.5993, 	specificity: 0.9975, 	f1: 0.7446, 	loss0.5435
+Train Epoch 16: 100%|██████████| 6137/6137 [08:38<00:00, 11.83it/s, loss=0.146]
+Train Epoch 16 ==> 	accuracy: 0.7758, 	precision: 0.9988, 	recall: 0.5523, 	specificity: 0.9994, 	f1: 0.7113,	 loss0.7954
+Test Epoch 16: 100%|██████████| 1748/1748 [01:01<00:00, 28.28it/s, loss=0.253]
+Test Epoch 16 ==> 	accuracy: 0.9167, 	precision: 0.9924, 	recall: 0.5778, 	specificity: 0.9989, 	f1: 0.7303, 	loss0.4145
+Train Epoch 17: 100%|██████████| 6137/6137 [08:37<00:00, 11.86it/s, loss=0.0914]
+Train Epoch 17 ==> 	accuracy: 0.7796, 	precision: 0.9989, 	recall: 0.5599, 	specificity: 0.9994, 	f1: 0.7176,	 loss0.7889
+Test Epoch 17: 100%|██████████| 1748/1748 [00:57<00:00, 30.21it/s, loss=0.165]
+Test Epoch 17 ==> 	accuracy: 0.9179, 	precision: 0.9859, 	recall: 0.5877, 	specificity: 0.9980, 	f1: 0.7364, 	loss0.4998
+Train Epoch 18: 100%|██████████| 6137/6137 [08:41<00:00, 11.76it/s, loss=0.116]
+Train Epoch 18 ==> 	accuracy: 0.7833, 	precision: 0.9989, 	recall: 0.5673, 	specificity: 0.9994, 	f1: 0.7236,	 loss0.7778
+Test Epoch 18: 100%|██████████| 1748/1748 [00:58<00:00, 29.73it/s, loss=0.193]
+Test Epoch 18 ==> 	accuracy: 0.9193, 	precision: 0.9923, 	recall: 0.5911, 	specificity: 0.9989, 	f1: 0.7409, 	loss0.3960
+Train Epoch 19: 100%|██████████| 6137/6137 [08:43<00:00, 11.73it/s, loss=0.135]
+Train Epoch 19 ==> 	accuracy: 0.7822, 	precision: 0.9989, 	recall: 0.5650, 	specificity: 0.9994, 	f1: 0.7218,	 loss0.7744
+Test Epoch 19: 100%|██████████| 1748/1748 [00:56<00:00, 30.79it/s, loss=0.414]
+Test Epoch 19 ==> 	accuracy: 0.9225, 	precision: 0.9873, 	recall: 0.6105, 	specificity: 0.9981, 	f1: 0.7545, 	loss0.5323
+Train Epoch 20: 100%|██████████| 6137/6137 [08:42<00:00, 11.75it/s, loss=0.126]
+Train Epoch 20 ==> 	accuracy: 0.7846, 	precision: 0.9990, 	recall: 0.5698, 	specificity: 0.9994, 	f1: 0.7257,	 loss0.7803
+Test Epoch 20: 100%|██████████| 1748/1748 [00:56<00:00, 31.20it/s, loss=0.125]
+Test Epoch 20 ==> 	accuracy: 0.9220, 	precision: 0.9919, 	recall: 0.6054, 	specificity: 0.9988, 	f1: 0.7519, 	loss0.4357
+Train Epoch 21: 100%|██████████| 6137/6137 [08:49<00:00, 11.59it/s, loss=0.153]
+Train Epoch 21 ==> 	accuracy: 0.7902, 	precision: 0.9990, 	recall: 0.5809, 	specificity: 0.9994, 	f1: 0.7347,	 loss0.7576
+Test Epoch 21: 100%|██████████| 1748/1748 [01:00<00:00, 29.05it/s, loss=0.263]
+Test Epoch 21 ==> 	accuracy: 0.9185, 	precision: 0.9840, 	recall: 0.5920, 	specificity: 0.9977, 	f1: 0.7392, 	loss0.5152
+Train Epoch 22: 100%|██████████| 6137/6137 [08:43<00:00, 11.72it/s, loss=0.116]
+Train Epoch 22 ==> 	accuracy: 0.7907, 	precision: 0.9990, 	recall: 0.5821, 	specificity: 0.9994, 	f1: 0.7356,	 loss0.7641
+Test Epoch 22: 100%|██████████| 1748/1748 [01:00<00:00, 29.05it/s, loss=0.153]
+Test Epoch 22 ==> 	accuracy: 0.9300, 	precision: 0.9888, 	recall: 0.6486, 	specificity: 0.9982, 	f1: 0.7833, 	loss0.4781
+Train Epoch 23: 100%|██████████| 6137/6137 [08:35<00:00, 11.91it/s, loss=0.146]
+Train Epoch 23 ==> 	accuracy: 0.7902, 	precision: 0.9990, 	recall: 0.5810, 	specificity: 0.9994, 	f1: 0.7347,	 loss0.7567
+Test Epoch 23: 100%|██████████| 1748/1748 [01:00<00:00, 28.75it/s, loss=0.194]
+Test Epoch 23 ==> 	accuracy: 0.9155, 	precision: 0.9866, 	recall: 0.5748, 	specificity: 0.9981, 	f1: 0.7264, 	loss0.5185
+Train Epoch 24: 100%|██████████| 6137/6137 [08:45<00:00, 11.68it/s, loss=0.159]
+Train Epoch 24 ==> 	accuracy: 0.7931, 	precision: 0.9990, 	recall: 0.5867, 	specificity: 0.9994, 	f1: 0.7393,	 loss0.7562
+Test Epoch 24: 100%|██████████| 1748/1748 [01:02<00:00, 27.77it/s, loss=0.377]
+Test Epoch 24 ==> 	accuracy: 0.9305, 	precision: 0.9862, 	recall: 0.6532, 	specificity: 0.9978, 	f1: 0.7858, 	loss0.5297
+Train Epoch 25: 100%|██████████| 6137/6137 [08:54<00:00, 11.47it/s, loss=0.128]
+Train Epoch 25 ==> 	accuracy: 0.7947, 	precision: 0.9990, 	recall: 0.5899, 	specificity: 0.9994, 	f1: 0.7418,	 loss0.7446
+Test Epoch 25: 100%|██████████| 1748/1748 [00:56<00:00, 30.87it/s, loss=0.273]
+Test Epoch 25 ==> 	accuracy: 0.9222, 	precision: 0.9878, 	recall: 0.6087, 	specificity: 0.9982, 	f1: 0.7532, 	loss0.4726
+Train Epoch 26: 100%|██████████| 6137/6137 [08:40<00:00, 11.80it/s, loss=0.106]
+Train Epoch 26 ==> 	accuracy: 0.7970, 	precision: 0.9991, 	recall: 0.5945, 	specificity: 0.9994, 	f1: 0.7454,	 loss0.7488
+Test Epoch 26: 100%|██████████| 1748/1748 [00:56<00:00, 30.99it/s, loss=0.278]
+Test Epoch 26 ==> 	accuracy: 0.9268, 	precision: 0.9917, 	recall: 0.6301, 	specificity: 0.9987, 	f1: 0.7705, 	loss0.3909
+Train Epoch 27: 100%|██████████| 6137/6137 [08:42<00:00, 11.74it/s, loss=0.125]
+Train Epoch 27 ==> 	accuracy: 0.7987, 	precision: 0.9991, 	recall: 0.5979, 	specificity: 0.9995, 	f1: 0.7481,	 loss0.7366
+Test Epoch 27: 100%|██████████| 1748/1748 [00:50<00:00, 34.87it/s, loss=0.18]
+Test Epoch 27 ==> 	accuracy: 0.9234, 	precision: 0.9797, 	recall: 0.6202, 	specificity: 0.9969, 	f1: 0.7596, 	loss0.6249
+Train Epoch 28: 100%|██████████| 6137/6137 [08:40<00:00, 11.79it/s, loss=0.138]
+Train Epoch 28 ==> 	accuracy: 0.7989, 	precision: 0.9991, 	recall: 0.5982, 	specificity: 0.9995, 	f1: 0.7484,	 loss0.7465
+Test Epoch 28: 100%|██████████| 1748/1748 [00:57<00:00, 30.16it/s, loss=0.297]
+Test Epoch 28 ==> 	accuracy: 0.9298, 	precision: 0.9893, 	recall: 0.6473, 	specificity: 0.9983, 	f1: 0.7826, 	loss0.4757
+Train Epoch 29: 100%|██████████| 6137/6137 [08:50<00:00, 11.56it/s, loss=0.0955]
+Train Epoch 29 ==> 	accuracy: 0.8032, 	precision: 0.9991, 	recall: 0.6069, 	specificity: 0.9995, 	f1: 0.7551,	 loss0.7224
+Test Epoch 29: 100%|██████████| 1748/1748 [01:00<00:00, 29.02it/s, loss=0.297]
+Test Epoch 29 ==> 	accuracy: 0.9280, 	precision: 0.9906, 	recall: 0.6368, 	specificity: 0.9985, 	f1: 0.7752, 	loss0.4456
+Train Epoch 30: 100%|██████████| 6137/6137 [08:47<00:00, 11.63it/s, loss=0.0857]
+Train Epoch 30 ==> 	accuracy: 0.8003, 	precision: 0.9992, 	recall: 0.6010, 	specificity: 0.9995, 	f1: 0.7506,	 loss0.7490
+Test Epoch 30: 100%|██████████| 1748/1748 [01:02<00:00, 27.83it/s, loss=1.35]
+Test Epoch 30 ==> 	accuracy: 0.9309, 	precision: 0.9876, 	recall: 0.6539, 	specificity: 0.9980, 	f1: 0.7868, 	loss0.5079
+Train Epoch 31: 100%|██████████| 6137/6137 [08:59<00:00, 11.37it/s, loss=0.154]
+Train Epoch 31 ==> 	accuracy: 0.8077, 	precision: 0.9992, 	recall: 0.6159, 	specificity: 0.9995, 	f1: 0.7621,	 loss0.7078
+Test Epoch 31: 100%|██████████| 1748/1748 [01:05<00:00, 26.49it/s, loss=0.212]
+Test Epoch 31 ==> 	accuracy: 0.9323, 	precision: 0.9869, 	recall: 0.6618, 	specificity: 0.9979, 	f1: 0.7923, 	loss0.5664
+Train Epoch 32: 100%|██████████| 6137/6137 [08:49<00:00, 11.58it/s, loss=0.131]
+Train Epoch 32 ==> 	accuracy: 0.8026, 	precision: 0.9992, 	recall: 0.6057, 	specificity: 0.9995, 	f1: 0.7542,	 loss0.7403
+Test Epoch 32: 100%|██████████| 1748/1748 [01:02<00:00, 28.11it/s, loss=0.128]
+Test Epoch 32 ==> 	accuracy: 0.9318, 	precision: 0.9885, 	recall: 0.6580, 	specificity: 0.9982, 	f1: 0.7901, 	loss0.4928
+Train Epoch 33: 100%|██████████| 6137/6137 [08:50<00:00, 11.58it/s, loss=0.225]
+Train Epoch 33 ==> 	accuracy: 0.8069, 	precision: 0.9992, 	recall: 0.6144, 	specificity: 0.9995, 	f1: 0.7609,	 loss0.7149
+Test Epoch 33: 100%|██████████| 1748/1748 [01:01<00:00, 28.33it/s, loss=0.138]
+Test Epoch 33 ==> 	accuracy: 0.9329, 	precision: 0.9882, 	recall: 0.6640, 	specificity: 0.9981, 	f1: 0.7943, 	loss0.5239
+Train Epoch 34: 100%|██████████| 6137/6137 [08:52<00:00, 11.52it/s, loss=0.104]
+Train Epoch 34 ==> 	accuracy: 0.8043, 	precision: 0.9992, 	recall: 0.6091, 	specificity: 0.9995, 	f1: 0.7568,	 loss0.7385
+Test Epoch 34: 100%|██████████| 1748/1748 [00:59<00:00, 29.30it/s, loss=0.134]
+Test Epoch 34 ==> 	accuracy: 0.9304, 	precision: 0.9900, 	recall: 0.6497, 	specificity: 0.9984, 	f1: 0.7845, 	loss0.4283
+Train Epoch 35: 100%|██████████| 6137/6137 [09:01<00:00, 11.33it/s, loss=0.146]
+Train Epoch 35 ==> 	accuracy: 0.8125, 	precision: 0.9992, 	recall: 0.6254, 	specificity: 0.9995, 	f1: 0.7693,	 loss0.7073
+Test Epoch 35: 100%|██████████| 1748/1748 [00:57<00:00, 30.29it/s, loss=0.268]
+Test Epoch 35 ==> 	accuracy: 0.9337, 	precision: 0.9875, 	recall: 0.6687, 	specificity: 0.9980, 	f1: 0.7974, 	loss0.5162
+Train Epoch 36: 100%|██████████| 6137/6137 [09:03<00:00, 11.29it/s, loss=0.112]
+Train Epoch 36 ==> 	accuracy: 0.8086, 	precision: 0.9992, 	recall: 0.6178, 	specificity: 0.9995, 	f1: 0.7635,	 loss0.7226
+Test Epoch 36: 100%|██████████| 1748/1748 [00:58<00:00, 29.72it/s, loss=0.0853]
+Test Epoch 36 ==> 	accuracy: 0.9268, 	precision: 0.9904, 	recall: 0.6311, 	specificity: 0.9985, 	f1: 0.7709, 	loss0.4416
+Train Epoch 37: 100%|██████████| 6137/6137 [08:34<00:00, 11.93it/s, loss=0.156]
+Train Epoch 37 ==> 	accuracy: 0.8088, 	precision: 0.9992, 	recall: 0.6181, 	specificity: 0.9995, 	f1: 0.7638,	 loss0.7201
+Test Epoch 37: 100%|██████████| 1748/1748 [00:56<00:00, 31.00it/s, loss=1.1]
+Test Epoch 37 ==> 	accuracy: 0.9313, 	precision: 0.9903, 	recall: 0.6542, 	specificity: 0.9984, 	f1: 0.7879, 	loss0.4439
+Train Epoch 38: 100%|██████████| 6137/6137 [08:12<00:00, 12.47it/s, loss=0.13]
+Train Epoch 38 ==> 	accuracy: 0.8099, 	precision: 0.9992, 	recall: 0.6203, 	specificity: 0.9995, 	f1: 0.7654,	 loss0.7187
+Test Epoch 38: 100%|██████████| 1748/1748 [00:54<00:00, 31.83it/s, loss=0.186]
+Test Epoch 38 ==> 	accuracy: 0.9256, 	precision: 0.9904, 	recall: 0.6249, 	specificity: 0.9985, 	f1: 0.7663, 	loss0.4483
+Train Epoch 39: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.124]
+Train Epoch 39 ==> 	accuracy: 0.8133, 	precision: 0.9992, 	recall: 0.6271, 	specificity: 0.9995, 	f1: 0.7706,	 loss0.7061
+Test Epoch 39: 100%|██████████| 1748/1748 [00:56<00:00, 30.73it/s, loss=0.842]
+Test Epoch 39 ==> 	accuracy: 0.9322, 	precision: 0.9866, 	recall: 0.6615, 	specificity: 0.9978, 	f1: 0.7920, 	loss0.5421
+Train Epoch 40: 100%|██████████| 6137/6137 [08:07<00:00, 12.60it/s, loss=0.0294]
+Train Epoch 40 ==> 	accuracy: 0.8135, 	precision: 0.9992, 	recall: 0.6274, 	specificity: 0.9995, 	f1: 0.7708,	 loss0.4656
+Test Epoch 40: 100%|██████████| 1748/1748 [00:57<00:00, 30.33it/s, loss=0.155]
+Test Epoch 40 ==> 	accuracy: 0.9317, 	precision: 0.9873, 	recall: 0.6586, 	specificity: 0.9979, 	f1: 0.7901, 	loss0.4909
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 41: 100%|██████████| 6137/6137 [08:18<00:00, 12.30it/s, loss=0.0207]
+Train Epoch 41 ==> 	accuracy: 0.8127, 	precision: 0.9993, 	recall: 0.6259, 	specificity: 0.9995, 	f1: 0.7697,	 loss0.4696
+Test Epoch 41: 100%|██████████| 1748/1748 [00:59<00:00, 29.33it/s, loss=0.142]
+Test Epoch 41 ==> 	accuracy: 0.9313, 	precision: 0.9895, 	recall: 0.6550, 	specificity: 0.9983, 	f1: 0.7882, 	loss0.4926
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 42: 100%|██████████| 6137/6137 [08:21<00:00, 12.23it/s, loss=0.0122]
+Train Epoch 42 ==> 	accuracy: 0.8146, 	precision: 0.9993, 	recall: 0.6296, 	specificity: 0.9995, 	f1: 0.7725,	 loss0.4622
+Test Epoch 42: 100%|██████████| 1748/1748 [01:05<00:00, 26.85it/s, loss=0.192]
+Test Epoch 42 ==> 	accuracy: 0.9351, 	precision: 0.9806, 	recall: 0.6811, 	specificity: 0.9967, 	f1: 0.8039, 	loss0.6294
+Adjusting learning rate of group 0 to 1.0000e-04.
+Train Epoch 43: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.0215]
+Train Epoch 43 ==> 	accuracy: 0.8159, 	precision: 0.9993, 	recall: 0.6323, 	specificity: 0.9996, 	f1: 0.7745,	 loss0.4531
+Test Epoch 43: 100%|██████████| 1748/1748 [00:56<00:00, 31.12it/s, loss=0.176]
+Test Epoch 43 ==> 	accuracy: 0.9328, 	precision: 0.9889, 	recall: 0.6629, 	specificity: 0.9982, 	f1: 0.7938, 	loss0.4981
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 44: 100%|██████████| 6137/6137 [08:26<00:00, 12.12it/s, loss=0.0169]
+Train Epoch 44 ==> 	accuracy: 0.8208, 	precision: 0.9993, 	recall: 0.6421, 	specificity: 0.9996, 	f1: 0.7818,	 loss0.4466
+Test Epoch 44: 100%|██████████| 1748/1748 [00:58<00:00, 30.10it/s, loss=0.398]
+Test Epoch 44 ==> 	accuracy: 0.9367, 	precision: 0.9846, 	recall: 0.6861, 	specificity: 0.9974, 	f1: 0.8087, 	loss0.6243
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 45: 100%|██████████| 6137/6137 [08:15<00:00, 12.38it/s, loss=0.0339]
+Train Epoch 45 ==> 	accuracy: 0.8176, 	precision: 0.9993, 	recall: 0.6357, 	specificity: 0.9995, 	f1: 0.7771,	 loss0.4588
+Test Epoch 45: 100%|██████████| 1748/1748 [01:01<00:00, 28.23it/s, loss=0.154]
+Test Epoch 45 ==> 	accuracy: 0.9323, 	precision: 0.9887, 	recall: 0.6608, 	specificity: 0.9982, 	f1: 0.7921, 	loss0.4844
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 46: 100%|██████████| 6137/6137 [08:17<00:00, 12.35it/s, loss=0.0305]
+Train Epoch 46 ==> 	accuracy: 0.8245, 	precision: 0.9993, 	recall: 0.6495, 	specificity: 0.9996, 	f1: 0.7873,	 loss0.4372
+Test Epoch 46: 100%|██████████| 1748/1748 [00:59<00:00, 29.42it/s, loss=0.336]
+Test Epoch 46 ==> 	accuracy: 0.9364, 	precision: 0.9812, 	recall: 0.6875, 	specificity: 0.9968, 	f1: 0.8085, 	loss0.7019
+Adjusting learning rate of group 0 to 9.0000e-05.
+Train Epoch 47: 100%|██████████| 6137/6137 [08:16<00:00, 12.35it/s, loss=0.0209]
+Train Epoch 47 ==> 	accuracy: 0.8207, 	precision: 0.9993, 	recall: 0.6419, 	specificity: 0.9996, 	f1: 0.7817,	 loss0.4517
+Test Epoch 47: 100%|██████████| 1748/1748 [00:58<00:00, 29.72it/s, loss=0.134]
+Test Epoch 47 ==> 	accuracy: 0.9334, 	precision: 0.9864, 	recall: 0.6679, 	specificity: 0.9978, 	f1: 0.7965, 	loss0.5615
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 48: 100%|██████████| 6137/6137 [08:10<00:00, 12.52it/s, loss=0.0327]
+Train Epoch 48 ==> 	accuracy: 0.8273, 	precision: 0.9994, 	recall: 0.6551, 	specificity: 0.9996, 	f1: 0.7914,	 loss0.4316
+Test Epoch 48: 100%|██████████| 1748/1748 [00:58<00:00, 30.10it/s, loss=0.337]
+Test Epoch 48 ==> 	accuracy: 0.9371, 	precision: 0.9807, 	recall: 0.6913, 	specificity: 0.9967, 	f1: 0.8110, 	loss0.6235
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 49: 100%|██████████| 6137/6137 [08:04<00:00, 12.67it/s, loss=0.0188]
+Train Epoch 49 ==> 	accuracy: 0.8247, 	precision: 0.9994, 	recall: 0.6497, 	specificity: 0.9996, 	f1: 0.7875,	 loss0.4505
+Test Epoch 49: 100%|██████████| 1748/1748 [00:58<00:00, 29.80it/s, loss=0.126]
+Test Epoch 49 ==> 	accuracy: 0.9348, 	precision: 0.9891, 	recall: 0.6734, 	specificity: 0.9982, 	f1: 0.8013, 	loss0.4602
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 50: 100%|██████████| 6137/6137 [08:07<00:00, 12.60it/s, loss=0.0167]
+Train Epoch 50 ==> 	accuracy: 0.8313, 	precision: 0.9993, 	recall: 0.6629, 	specificity: 0.9996, 	f1: 0.7971,	 loss0.4201
+Test Epoch 50: 100%|██████████| 1748/1748 [00:55<00:00, 31.51it/s, loss=1.44]
+Test Epoch 50 ==> 	accuracy: 0.9417, 	precision: 0.9795, 	recall: 0.7161, 	specificity: 0.9964, 	f1: 0.8273, 	loss0.6547
+Adjusting learning rate of group 0 to 8.1000e-05.
+Train Epoch 51: 100%|██████████| 6137/6137 [08:02<00:00, 12.71it/s, loss=0.0243]
+Train Epoch 51 ==> 	accuracy: 0.8271, 	precision: 0.9994, 	recall: 0.6546, 	specificity: 0.9996, 	f1: 0.7911,	 loss0.4435
+Test Epoch 51: 100%|██████████| 1748/1748 [00:54<00:00, 32.10it/s, loss=0.216]
+Test Epoch 51 ==> 	accuracy: 0.9393, 	precision: 0.9844, 	recall: 0.6997, 	specificity: 0.9973, 	f1: 0.8180, 	loss0.5765
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 52: 100%|██████████| 6137/6137 [07:44<00:00, 13.21it/s, loss=0.0155]
+Train Epoch 52 ==> 	accuracy: 0.8334, 	precision: 0.9994, 	recall: 0.6673, 	specificity: 0.9996, 	f1: 0.8002,	 loss0.4170
+Test Epoch 52: 100%|██████████| 1748/1748 [00:59<00:00, 29.37it/s, loss=0.204]
+Test Epoch 52 ==> 	accuracy: 0.9394, 	precision: 0.9822, 	recall: 0.7020, 	specificity: 0.9969, 	f1: 0.8188, 	loss0.6394
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 53: 100%|██████████| 6137/6137 [08:29<00:00, 12.04it/s, loss=0.0224]
+Train Epoch 53 ==> 	accuracy: 0.8316, 	precision: 0.9994, 	recall: 0.6635, 	specificity: 0.9996, 	f1: 0.7976,	 loss0.4308
+Test Epoch 53: 100%|██████████| 1748/1748 [01:02<00:00, 27.99it/s, loss=0.693]
+Test Epoch 53 ==> 	accuracy: 0.9392, 	precision: 0.9857, 	recall: 0.6983, 	specificity: 0.9975, 	f1: 0.8175, 	loss0.5485
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 54: 100%|██████████| 6137/6137 [08:37<00:00, 11.85it/s, loss=0.0446]
+Train Epoch 54 ==> 	accuracy: 0.8347, 	precision: 0.9994, 	recall: 0.6697, 	specificity: 0.9996, 	f1: 0.8020,	 loss0.4177
+Test Epoch 54: 100%|██████████| 1748/1748 [00:59<00:00, 29.48it/s, loss=0.155]
+Test Epoch 54 ==> 	accuracy: 0.9405, 	precision: 0.9758, 	recall: 0.7126, 	specificity: 0.9957, 	f1: 0.8237, 	loss0.7994
+Adjusting learning rate of group 0 to 7.2900e-05.
+Train Epoch 55: 100%|██████████| 6137/6137 [08:19<00:00, 12.28it/s, loss=0.0239]
+Train Epoch 55 ==> 	accuracy: 0.8331, 	precision: 0.9994, 	recall: 0.6666, 	specificity: 0.9996, 	f1: 0.7998,	 loss0.4229
+Test Epoch 55: 100%|██████████| 1748/1748 [01:03<00:00, 27.33it/s, loss=0.138]
+Test Epoch 55 ==> 	accuracy: 0.9401, 	precision: 0.9850, 	recall: 0.7036, 	specificity: 0.9974, 	f1: 0.8208, 	loss0.5930
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 56: 100%|██████████| 6137/6137 [08:26<00:00, 12.11it/s, loss=0.0142]
+Train Epoch 56 ==> 	accuracy: 0.8352, 	precision: 0.9995, 	recall: 0.6707, 	specificity: 0.9996, 	f1: 0.8027,	 loss0.4178
+Test Epoch 56: 100%|██████████| 1748/1748 [01:02<00:00, 28.11it/s, loss=0.147]
+Test Epoch 56 ==> 	accuracy: 0.9391, 	precision: 0.9791, 	recall: 0.7029, 	specificity: 0.9964, 	f1: 0.8183, 	loss0.7341
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 57: 100%|██████████| 6137/6137 [08:20<00:00, 12.26it/s, loss=0.014]
+Train Epoch 57 ==> 	accuracy: 0.8373, 	precision: 0.9995, 	recall: 0.6750, 	specificity: 0.9996, 	f1: 0.8058,	 loss0.4128
+Test Epoch 57: 100%|██████████| 1748/1748 [00:58<00:00, 29.79it/s, loss=0.698]
+Test Epoch 57 ==> 	accuracy: 0.9415, 	precision: 0.9818, 	recall: 0.7136, 	specificity: 0.9968, 	f1: 0.8265, 	loss0.6252
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 58: 100%|██████████| 6137/6137 [08:14<00:00, 12.41it/s, loss=0.0064]
+Train Epoch 58 ==> 	accuracy: 0.8367, 	precision: 0.9995, 	recall: 0.6737, 	specificity: 0.9996, 	f1: 0.8049,	 loss0.4176
+Test Epoch 58: 100%|██████████| 1748/1748 [00:58<00:00, 29.85it/s, loss=0.102]
+Test Epoch 58 ==> 	accuracy: 0.9384, 	precision: 0.9835, 	recall: 0.6961, 	specificity: 0.9972, 	f1: 0.8152, 	loss0.5903
+Adjusting learning rate of group 0 to 6.5610e-05.
+Train Epoch 59: 100%|██████████| 6137/6137 [08:32<00:00, 11.98it/s, loss=0.0209]
+Train Epoch 59 ==> 	accuracy: 0.8380, 	precision: 0.9994, 	recall: 0.6765, 	specificity: 0.9996, 	f1: 0.8068,	 loss0.4146
+Test Epoch 59: 100%|██████████| 1748/1748 [01:03<00:00, 27.55it/s, loss=0.166]
+Test Epoch 59 ==> 	accuracy: 0.9411, 	precision: 0.9838, 	recall: 0.7096, 	specificity: 0.9972, 	f1: 0.8245, 	loss0.6105
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 60: 100%|██████████| 6137/6137 [08:21<00:00, 12.23it/s, loss=0.0155]
+Train Epoch 60 ==> 	accuracy: 0.8398, 	precision: 0.9994, 	recall: 0.6800, 	specificity: 0.9996, 	f1: 0.8093,	 loss0.4082
+Test Epoch 60: 100%|██████████| 1748/1748 [01:04<00:00, 27.24it/s, loss=0.552]
+Test Epoch 60 ==> 	accuracy: 0.9428, 	precision: 0.9800, 	recall: 0.7214, 	specificity: 0.9964, 	f1: 0.8310, 	loss0.7593
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 61: 100%|██████████| 6137/6137 [08:31<00:00, 11.99it/s, loss=0.0222]
+Train Epoch 61 ==> 	accuracy: 0.8412, 	precision: 0.9995, 	recall: 0.6827, 	specificity: 0.9996, 	f1: 0.8113,	 loss0.4070
+Test Epoch 61: 100%|██████████| 1748/1748 [01:01<00:00, 28.63it/s, loss=0.111]
+Test Epoch 61 ==> 	accuracy: 0.9414, 	precision: 0.9803, 	recall: 0.7142, 	specificity: 0.9965, 	f1: 0.8264, 	loss0.6834
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 62: 100%|██████████| 6137/6137 [08:28<00:00, 12.06it/s, loss=0.0303]
+Train Epoch 62 ==> 	accuracy: 0.8419, 	precision: 0.9995, 	recall: 0.6842, 	specificity: 0.9996, 	f1: 0.8123,	 loss0.4028
+Test Epoch 62: 100%|██████████| 1748/1748 [00:59<00:00, 29.31it/s, loss=0.233]
+Test Epoch 62 ==> 	accuracy: 0.9421, 	precision: 0.9814, 	recall: 0.7166, 	specificity: 0.9967, 	f1: 0.8284, 	loss0.7383
+Adjusting learning rate of group 0 to 5.9049e-05.
+Train Epoch 63: 100%|██████████| 6137/6137 [08:14<00:00, 12.41it/s, loss=0.105]
+Train Epoch 63 ==> 	accuracy: 0.8434, 	precision: 0.9995, 	recall: 0.6871, 	specificity: 0.9997, 	f1: 0.8144,	 loss0.4020
+Test Epoch 63: 100%|██████████| 1748/1748 [01:01<00:00, 28.35it/s, loss=0.189]
+Test Epoch 63 ==> 	accuracy: 0.9401, 	precision: 0.9825, 	recall: 0.7056, 	specificity: 0.9970, 	f1: 0.8213, 	loss0.6793
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 64: 100%|██████████| 6137/6137 [08:31<00:00, 12.00it/s, loss=0.0236]
+Train Epoch 64 ==> 	accuracy: 0.8440, 	precision: 0.9995, 	recall: 0.6883, 	specificity: 0.9996, 	f1: 0.8152,	 loss0.3992
+Test Epoch 64: 100%|██████████| 1748/1748 [01:00<00:00, 28.92it/s, loss=0.258]
+Test Epoch 64 ==> 	accuracy: 0.9453, 	precision: 0.9777, 	recall: 0.7367, 	specificity: 0.9959, 	f1: 0.8402, 	loss0.7783
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 65: 100%|██████████| 6137/6137 [08:25<00:00, 12.14it/s, loss=0.009]
+Train Epoch 65 ==> 	accuracy: 0.8483, 	precision: 0.9995, 	recall: 0.6968, 	specificity: 0.9997, 	f1: 0.8212,	 loss0.3911
+Test Epoch 65: 100%|██████████| 1748/1748 [01:08<00:00, 25.50it/s, loss=0.807]
+Test Epoch 65 ==> 	accuracy: 0.9450, 	precision: 0.9788, 	recall: 0.7342, 	specificity: 0.9961, 	f1: 0.8390, 	loss0.8214
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 66: 100%|██████████| 6137/6137 [08:40<00:00, 11.78it/s, loss=0.0157]
+Train Epoch 66 ==> 	accuracy: 0.8457, 	precision: 0.9995, 	recall: 0.6917, 	specificity: 0.9997, 	f1: 0.8176,	 loss0.4002
+Test Epoch 66: 100%|██████████| 1748/1748 [01:05<00:00, 26.67it/s, loss=0.197]
+Test Epoch 66 ==> 	accuracy: 0.9443, 	precision: 0.9801, 	recall: 0.7294, 	specificity: 0.9964, 	f1: 0.8364, 	loss0.7109
+Adjusting learning rate of group 0 to 5.3144e-05.
+Train Epoch 67: 100%|██████████| 6137/6137 [08:20<00:00, 12.27it/s, loss=0.0186]
+Train Epoch 67 ==> 	accuracy: 0.8496, 	precision: 0.9995, 	recall: 0.6994, 	specificity: 0.9997, 	f1: 0.8230,	 loss0.3888
+Test Epoch 67: 100%|██████████| 1748/1748 [00:55<00:00, 31.56it/s, loss=2.48]
+Test Epoch 67 ==> 	accuracy: 0.9460, 	precision: 0.9765, 	recall: 0.7410, 	specificity: 0.9957, 	f1: 0.8426, 	loss0.8294
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 68: 100%|██████████| 6137/6137 [08:28<00:00, 12.08it/s, loss=0.0193]
+Train Epoch 68 ==> 	accuracy: 0.8495, 	precision: 0.9995, 	recall: 0.6994, 	specificity: 0.9997, 	f1: 0.8230,	 loss0.3885
+Test Epoch 68: 100%|██████████| 1748/1748 [00:57<00:00, 30.52it/s, loss=0.0748]
+Test Epoch 68 ==> 	accuracy: 0.9468, 	precision: 0.9758, 	recall: 0.7461, 	specificity: 0.9955, 	f1: 0.8456, 	loss0.9429
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 69: 100%|██████████| 6137/6137 [08:23<00:00, 12.19it/s, loss=0.0279]
+Train Epoch 69 ==> 	accuracy: 0.8506, 	precision: 0.9995, 	recall: 0.7016, 	specificity: 0.9997, 	f1: 0.8245,	 loss0.3848
+Test Epoch 69: 100%|██████████| 1748/1748 [00:54<00:00, 32.33it/s, loss=0.207]
+Test Epoch 69 ==> 	accuracy: 0.9450, 	precision: 0.9805, 	recall: 0.7328, 	specificity: 0.9965, 	f1: 0.8387, 	loss0.7862
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 70: 100%|██████████| 6137/6137 [08:10<00:00, 12.50it/s, loss=0.0309]
+Train Epoch 70 ==> 	accuracy: 0.8493, 	precision: 0.9995, 	recall: 0.6989, 	specificity: 0.9996, 	f1: 0.8226,	 loss0.3898
+Test Epoch 70: 100%|██████████| 1748/1748 [01:01<00:00, 28.19it/s, loss=0.137]
+Test Epoch 70 ==> 	accuracy: 0.9449, 	precision: 0.9793, 	recall: 0.7332, 	specificity: 0.9962, 	f1: 0.8386, 	loss0.7844
+Adjusting learning rate of group 0 to 4.7830e-05.
+Train Epoch 71: 100%|██████████| 6137/6137 [08:15<00:00, 12.38it/s, loss=0.0104]
+Train Epoch 71 ==> 	accuracy: 0.8517, 	precision: 0.9996, 	recall: 0.7036, 	specificity: 0.9997, 	f1: 0.8259,	 loss0.3852
+Test Epoch 71: 100%|██████████| 1748/1748 [00:58<00:00, 29.63it/s, loss=0.413]
+Test Epoch 71 ==> 	accuracy: 0.9465, 	precision: 0.9752, 	recall: 0.7448, 	specificity: 0.9954, 	f1: 0.8446, 	loss0.9089
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 72: 100%|██████████| 6137/6137 [08:22<00:00, 12.21it/s, loss=0.0168]
+Train Epoch 72 ==> 	accuracy: 0.8546, 	precision: 0.9995, 	recall: 0.7095, 	specificity: 0.9997, 	f1: 0.8299,	 loss0.3746
+Test Epoch 72: 100%|██████████| 1748/1748 [00:58<00:00, 29.74it/s, loss=1.93]
+Test Epoch 72 ==> 	accuracy: 0.9455, 	precision: 0.9796, 	recall: 0.7360, 	specificity: 0.9963, 	f1: 0.8405, 	loss0.7849
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 73: 100%|██████████| 6137/6137 [08:37<00:00, 11.87it/s, loss=0.0205]
+Train Epoch 73 ==> 	accuracy: 0.8543, 	precision: 0.9996, 	recall: 0.7090, 	specificity: 0.9997, 	f1: 0.8296,	 loss0.3799
+Test Epoch 73: 100%|██████████| 1748/1748 [00:52<00:00, 33.01it/s, loss=0.451]
+Test Epoch 73 ==> 	accuracy: 0.9451, 	precision: 0.9774, 	recall: 0.7356, 	specificity: 0.9959, 	f1: 0.8394, 	loss0.8713
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 74: 100%|██████████| 6137/6137 [08:23<00:00, 12.18it/s, loss=0.0154]
+Train Epoch 74 ==> 	accuracy: 0.8557, 	precision: 0.9996, 	recall: 0.7117, 	specificity: 0.9997, 	f1: 0.8314,	 loss0.3710
+Test Epoch 74: 100%|██████████| 1748/1748 [00:53<00:00, 32.43it/s, loss=0.158]
+Test Epoch 74 ==> 	accuracy: 0.9435, 	precision: 0.9803, 	recall: 0.7251, 	specificity: 0.9965, 	f1: 0.8336, 	loss0.7525
+Adjusting learning rate of group 0 to 4.3047e-05.
+Train Epoch 75: 100%|██████████| 6137/6137 [08:17<00:00, 12.34it/s, loss=0.0192]
+Train Epoch 75 ==> 	accuracy: 0.8535, 	precision: 0.9995, 	recall: 0.7074, 	specificity: 0.9997, 	f1: 0.8284,	 loss0.3826
+Test Epoch 75: 100%|██████████| 1748/1748 [00:54<00:00, 31.84it/s, loss=4.67]
+Test Epoch 75 ==> 	accuracy: 0.9474, 	precision: 0.9757, 	recall: 0.7489, 	specificity: 0.9955, 	f1: 0.8474, 	loss0.8841
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 76: 100%|██████████| 6137/6137 [07:59<00:00, 12.80it/s, loss=0.0348]
+Train Epoch 76 ==> 	accuracy: 0.8580, 	precision: 0.9996, 	recall: 0.7163, 	specificity: 0.9997, 	f1: 0.8346,	 loss0.3665
+Test Epoch 76: 100%|██████████| 1748/1748 [00:50<00:00, 34.61it/s, loss=0.513]
+Test Epoch 76 ==> 	accuracy: 0.9467, 	precision: 0.9781, 	recall: 0.7437, 	specificity: 0.9960, 	f1: 0.8449, 	loss0.8621
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 77: 100%|██████████| 6137/6137 [07:45<00:00, 13.19it/s, loss=0.036]
+Train Epoch 77 ==> 	accuracy: 0.8574, 	precision: 0.9996, 	recall: 0.7152, 	specificity: 0.9997, 	f1: 0.8338,	 loss0.3718
+Test Epoch 77: 100%|██████████| 1748/1748 [00:53<00:00, 32.51it/s, loss=0.245]
+Test Epoch 77 ==> 	accuracy: 0.9476, 	precision: 0.9734, 	recall: 0.7519, 	specificity: 0.9950, 	f1: 0.8484, 	loss0.9478
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 78: 100%|██████████| 6137/6137 [07:51<00:00, 13.01it/s, loss=0.0366]
+Train Epoch 78 ==> 	accuracy: 0.8574, 	precision: 0.9995, 	recall: 0.7151, 	specificity: 0.9997, 	f1: 0.8337,	 loss0.3714
+Test Epoch 78: 100%|██████████| 1748/1748 [00:57<00:00, 30.44it/s, loss=0.129]
+Test Epoch 78 ==> 	accuracy: 0.9456, 	precision: 0.9772, 	recall: 0.7385, 	specificity: 0.9958, 	f1: 0.8413, 	loss0.8451
+Adjusting learning rate of group 0 to 3.8742e-05.
+Train Epoch 79: 100%|██████████| 6137/6137 [08:09<00:00, 12.54it/s, loss=0.0191]
+Train Epoch 79 ==> 	accuracy: 0.8572, 	precision: 0.9995, 	recall: 0.7147, 	specificity: 0.9997, 	f1: 0.8335,	 loss0.3679
+Test Epoch 79: 100%|██████████| 1748/1748 [00:58<00:00, 29.88it/s, loss=0.214]
+Test Epoch 79 ==> 	accuracy: 0.9484, 	precision: 0.9690, 	recall: 0.7598, 	specificity: 0.9941, 	f1: 0.8518, 	loss1.1427
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 80: 100%|██████████| 6137/6137 [08:23<00:00, 12.18it/s, loss=0.0182]
+Train Epoch 80 ==> 	accuracy: 0.8580, 	precision: 0.9996, 	recall: 0.7163, 	specificity: 0.9997, 	f1: 0.8345,	 loss0.3742
+Test Epoch 80: 100%|██████████| 1748/1748 [00:53<00:00, 32.39it/s, loss=0.115]
+Test Epoch 80 ==> 	accuracy: 0.9475, 	precision: 0.9771, 	recall: 0.7482, 	specificity: 0.9958, 	f1: 0.8475, 	loss0.8350
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 81: 100%|██████████| 6137/6137 [07:55<00:00, 12.91it/s, loss=0.0103]
+Train Epoch 81 ==> 	accuracy: 0.8606, 	precision: 0.9996, 	recall: 0.7216, 	specificity: 0.9997, 	f1: 0.8381,	 loss0.3575
+Test Epoch 81: 100%|██████████| 1748/1748 [00:58<00:00, 30.03it/s, loss=0.219]
+Test Epoch 81 ==> 	accuracy: 0.9472, 	precision: 0.9750, 	recall: 0.7487, 	specificity: 0.9953, 	f1: 0.8470, 	loss0.8619
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 82: 100%|██████████| 6137/6137 [08:11<00:00, 12.48it/s, loss=0.028]
+Train Epoch 82 ==> 	accuracy: 0.8591, 	precision: 0.9996, 	recall: 0.7184, 	specificity: 0.9997, 	f1: 0.8360,	 loss0.3720
+Test Epoch 82: 100%|██████████| 1748/1748 [00:54<00:00, 32.17it/s, loss=0.204]
+Test Epoch 82 ==> 	accuracy: 0.9490, 	precision: 0.9737, 	recall: 0.7589, 	specificity: 0.9950, 	f1: 0.8530, 	loss0.9527
+Adjusting learning rate of group 0 to 3.4868e-05.
+Train Epoch 83: 100%|██████████| 6137/6137 [07:54<00:00, 12.93it/s, loss=0.017]
+Train Epoch 83 ==> 	accuracy: 0.8616, 	precision: 0.9996, 	recall: 0.7236, 	specificity: 0.9997, 	f1: 0.8395,	 loss0.3596
+Test Epoch 83: 100%|██████████| 1748/1748 [00:49<00:00, 35.60it/s, loss=0.659]
+Test Epoch 83 ==> 	accuracy: 0.9485, 	precision: 0.9726, 	recall: 0.7575, 	specificity: 0.9948, 	f1: 0.8517, 	loss1.0115
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 84: 100%|██████████| 6137/6137 [08:20<00:00, 12.27it/s, loss=0.0042]
+Train Epoch 84 ==> 	accuracy: 0.8617, 	precision: 0.9996, 	recall: 0.7236, 	specificity: 0.9997, 	f1: 0.8395,	 loss0.3639
+Test Epoch 84: 100%|██████████| 1748/1748 [00:50<00:00, 34.60it/s, loss=1.35]
+Test Epoch 84 ==> 	accuracy: 0.9484, 	precision: 0.9748, 	recall: 0.7549, 	specificity: 0.9953, 	f1: 0.8509, 	loss0.9792
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 85: 100%|██████████| 6137/6137 [08:11<00:00, 12.49it/s, loss=0.0233]
+Train Epoch 85 ==> 	accuracy: 0.8640, 	precision: 0.9996, 	recall: 0.7283, 	specificity: 0.9997, 	f1: 0.8426,	 loss0.3543
+Test Epoch 85: 100%|██████████| 1748/1748 [00:51<00:00, 33.78it/s, loss=0.236]
+Test Epoch 85 ==> 	accuracy: 0.9500, 	precision: 0.9701, 	recall: 0.7674, 	specificity: 0.9943, 	f1: 0.8569, 	loss1.1166
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 86: 100%|██████████| 6137/6137 [08:20<00:00, 12.27it/s, loss=0.0175]
+Train Epoch 86 ==> 	accuracy: 0.8638, 	precision: 0.9996, 	recall: 0.7279, 	specificity: 0.9997, 	f1: 0.8424,	 loss0.3550
+Test Epoch 86: 100%|██████████| 1748/1748 [00:58<00:00, 30.08it/s, loss=0.186]
+Test Epoch 86 ==> 	accuracy: 0.9490, 	precision: 0.9734, 	recall: 0.7594, 	specificity: 0.9950, 	f1: 0.8532, 	loss1.0122
+Adjusting learning rate of group 0 to 3.1381e-05.
+Train Epoch 87: 100%|██████████| 6137/6137 [08:22<00:00, 12.22it/s, loss=0.0144]
+Train Epoch 87 ==> 	accuracy: 0.8630, 	precision: 0.9996, 	recall: 0.7263, 	specificity: 0.9997, 	f1: 0.8413,	 loss0.3603
+Test Epoch 87: 100%|██████████| 1748/1748 [00:57<00:00, 30.16it/s, loss=0.143]
+Test Epoch 87 ==> 	accuracy: 0.9476, 	precision: 0.9750, 	recall: 0.7505, 	specificity: 0.9953, 	f1: 0.8482, 	loss0.9070
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 88: 100%|██████████| 6137/6137 [08:03<00:00, 12.70it/s, loss=0.0093]
+Train Epoch 88 ==> 	accuracy: 0.8652, 	precision: 0.9996, 	recall: 0.7306, 	specificity: 0.9997, 	f1: 0.8442,	 loss0.3537
+Test Epoch 88: 100%|██████████| 1748/1748 [00:53<00:00, 32.85it/s, loss=0.467]
+Test Epoch 88 ==> 	accuracy: 0.9484, 	precision: 0.9746, 	recall: 0.7552, 	specificity: 0.9952, 	f1: 0.8510, 	loss0.9478
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 89: 100%|██████████| 6137/6137 [08:22<00:00, 12.20it/s, loss=0.0156]
+Train Epoch 89 ==> 	accuracy: 0.8666, 	precision: 0.9996, 	recall: 0.7334, 	specificity: 0.9997, 	f1: 0.8461,	 loss0.3493
+Test Epoch 89: 100%|██████████| 1748/1748 [00:56<00:00, 31.20it/s, loss=0.103]
+Test Epoch 89 ==> 	accuracy: 0.9494, 	precision: 0.9724, 	recall: 0.7625, 	specificity: 0.9948, 	f1: 0.8548, 	loss1.0686
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 90: 100%|██████████| 6137/6137 [08:19<00:00, 12.28it/s, loss=0.0306]
+Train Epoch 90 ==> 	accuracy: 0.8657, 	precision: 0.9996, 	recall: 0.7317, 	specificity: 0.9997, 	f1: 0.8450,	 loss0.3542
+Test Epoch 90: 100%|██████████| 1748/1748 [00:58<00:00, 30.11it/s, loss=0.1]
+Test Epoch 90 ==> 	accuracy: 0.9502, 	precision: 0.9706, 	recall: 0.7679, 	specificity: 0.9944, 	f1: 0.8574, 	loss1.1195
+Adjusting learning rate of group 0 to 2.8243e-05.
+Train Epoch 91: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.0156]
+Train Epoch 91 ==> 	accuracy: 0.8655, 	precision: 0.9996, 	recall: 0.7313, 	specificity: 0.9997, 	f1: 0.8447,	 loss0.3522
+Test Epoch 91: 100%|██████████| 1748/1748 [00:57<00:00, 30.44it/s, loss=0.197]
+Test Epoch 91 ==> 	accuracy: 0.9495, 	precision: 0.9727, 	recall: 0.7626, 	specificity: 0.9948, 	f1: 0.8549, 	loss1.0155
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 92: 100%|██████████| 6137/6137 [08:18<00:00, 12.32it/s, loss=0.0129]
+Train Epoch 92 ==> 	accuracy: 0.8671, 	precision: 0.9996, 	recall: 0.7346, 	specificity: 0.9997, 	f1: 0.8468,	 loss0.3506
+Test Epoch 92: 100%|██████████| 1748/1748 [00:57<00:00, 30.37it/s, loss=3.12]
+Test Epoch 92 ==> 	accuracy: 0.9496, 	precision: 0.9728, 	recall: 0.7630, 	specificity: 0.9948, 	f1: 0.8552, 	loss1.0943
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 93: 100%|██████████| 6137/6137 [08:24<00:00, 12.18it/s, loss=0.0356]
+Train Epoch 93 ==> 	accuracy: 0.8691, 	precision: 0.9996, 	recall: 0.7385, 	specificity: 0.9997, 	f1: 0.8495,	 loss0.3386
+Test Epoch 93: 100%|██████████| 1748/1748 [00:58<00:00, 30.09it/s, loss=0.269]
+Test Epoch 93 ==> 	accuracy: 0.9512, 	precision: 0.9669, 	recall: 0.7767, 	specificity: 0.9936, 	f1: 0.8614, 	loss1.3348
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 94: 100%|██████████| 6137/6137 [08:29<00:00, 12.05it/s, loss=0.0142]
+Train Epoch 94 ==> 	accuracy: 0.8671, 	precision: 0.9996, 	recall: 0.7345, 	specificity: 0.9997, 	f1: 0.8468,	 loss0.3503
+Test Epoch 94: 100%|██████████| 1748/1748 [00:58<00:00, 29.77it/s, loss=0.133]
+Test Epoch 94 ==> 	accuracy: 0.9508, 	precision: 0.9699, 	recall: 0.7719, 	specificity: 0.9942, 	f1: 0.8596, 	loss1.1712
+Adjusting learning rate of group 0 to 2.5419e-05.
+Train Epoch 95: 100%|██████████| 6137/6137 [08:27<00:00, 12.09it/s, loss=0.0192]
+Train Epoch 95 ==> 	accuracy: 0.8681, 	precision: 0.9996, 	recall: 0.7366, 	specificity: 0.9997, 	f1: 0.8482,	 loss0.3459
+Test Epoch 95: 100%|██████████| 1748/1748 [00:59<00:00, 29.15it/s, loss=0.191]
+Test Epoch 95 ==> 	accuracy: 0.9467, 	precision: 0.9760, 	recall: 0.7449, 	specificity: 0.9956, 	f1: 0.8449, 	loss0.9437
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 96: 100%|██████████| 6137/6137 [08:23<00:00, 12.18it/s, loss=0.0131]
+Train Epoch 96 ==> 	accuracy: 0.8696, 	precision: 0.9996, 	recall: 0.7394, 	specificity: 0.9997, 	f1: 0.8500,	 loss0.3428
+Test Epoch 96: 100%|██████████| 1748/1748 [00:59<00:00, 29.62it/s, loss=3.07]
+Test Epoch 96 ==> 	accuracy: 0.9508, 	precision: 0.9700, 	recall: 0.7715, 	specificity: 0.9942, 	f1: 0.8595, 	loss1.1725
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 97: 100%|██████████| 6137/6137 [08:30<00:00, 12.02it/s, loss=0.023]
+Train Epoch 97 ==> 	accuracy: 0.8689, 	precision: 0.9996, 	recall: 0.7382, 	specificity: 0.9997, 	f1: 0.8492,	 loss0.3462
+Test Epoch 97: 100%|██████████| 1748/1748 [00:54<00:00, 31.96it/s, loss=0.143]
+Test Epoch 97 ==> 	accuracy: 0.9495, 	precision: 0.9740, 	recall: 0.7618, 	specificity: 0.9951, 	f1: 0.8549, 	loss1.0114
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 98: 100%|██████████| 6137/6137 [08:03<00:00, 12.69it/s, loss=0.0207]
+Train Epoch 98 ==> 	accuracy: 0.8698, 	precision: 0.9996, 	recall: 0.7400, 	specificity: 0.9997, 	f1: 0.8504,	 loss0.3400
+Test Epoch 98: 100%|██████████| 1748/1748 [00:55<00:00, 31.40it/s, loss=0.391]
+Test Epoch 98 ==> 	accuracy: 0.9502, 	precision: 0.9711, 	recall: 0.7677, 	specificity: 0.9945, 	f1: 0.8575, 	loss1.1312
+Adjusting learning rate of group 0 to 2.2877e-05.
+Train Epoch 99: 100%|██████████| 6137/6137 [08:17<00:00, 12.33it/s, loss=0.0295]
+Train Epoch 99 ==> 	accuracy: 0.8687, 	precision: 0.9997, 	recall: 0.7377, 	specificity: 0.9997, 	f1: 0.8489,	 loss0.3497
+Test Epoch 99: 100%|██████████| 1748/1748 [01:00<00:00, 28.72it/s, loss=0.583]
+Test Epoch 99 ==> 	accuracy: 0.9502, 	precision: 0.9699, 	recall: 0.7687, 	specificity: 0.9942, 	f1: 0.8576, 	loss1.2386
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 100: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.0116]
+Train Epoch 100 ==> 	accuracy: 0.8707, 	precision: 0.9996, 	recall: 0.7417, 	specificity: 0.9997, 	f1: 0.8516,	 loss0.3381
+Test Epoch 100: 100%|██████████| 1748/1748 [00:56<00:00, 31.14it/s, loss=0.342]
+Test Epoch 100 ==> 	accuracy: 0.9501, 	precision: 0.9719, 	recall: 0.7664, 	specificity: 0.9946, 	f1: 0.8570, 	loss1.0899
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 101: 100%|██████████| 6137/6137 [08:29<00:00, 12.06it/s, loss=0.022]
+Train Epoch 101 ==> 	accuracy: 0.8710, 	precision: 0.9996, 	recall: 0.7422, 	specificity: 0.9997, 	f1: 0.8519,	 loss0.3445
+Test Epoch 101: 100%|██████████| 1748/1748 [00:55<00:00, 31.33it/s, loss=0.168]
+Test Epoch 101 ==> 	accuracy: 0.9503, 	precision: 0.9717, 	recall: 0.7677, 	specificity: 0.9946, 	f1: 0.8577, 	loss1.1493
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 102: 100%|██████████| 6137/6137 [08:28<00:00, 12.08it/s, loss=0.0045]
+Train Epoch 102 ==> 	accuracy: 0.8707, 	precision: 0.9996, 	recall: 0.7417, 	specificity: 0.9997, 	f1: 0.8515,	 loss0.3407
+Test Epoch 102: 100%|██████████| 1748/1748 [00:57<00:00, 30.29it/s, loss=0.667]
+Test Epoch 102 ==> 	accuracy: 0.9506, 	precision: 0.9686, 	recall: 0.7719, 	specificity: 0.9939, 	f1: 0.8591, 	loss1.1817
+Adjusting learning rate of group 0 to 2.0589e-05.
+Train Epoch 103: 100%|██████████| 6137/6137 [08:26<00:00, 12.12it/s, loss=0.0156]
+Train Epoch 103 ==> 	accuracy: 0.8705, 	precision: 0.9996, 	recall: 0.7412, 	specificity: 0.9997, 	f1: 0.8512,	 loss0.3430
+Test Epoch 103: 100%|██████████| 1748/1748 [00:59<00:00, 29.40it/s, loss=0.171]
+Test Epoch 103 ==> 	accuracy: 0.9500, 	precision: 0.9739, 	recall: 0.7642, 	specificity: 0.9950, 	f1: 0.8564, 	loss0.9858
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 104: 100%|██████████| 6137/6137 [08:20<00:00, 12.27it/s, loss=0.0229]
+Train Epoch 104 ==> 	accuracy: 0.8731, 	precision: 0.9996, 	recall: 0.7465, 	specificity: 0.9997, 	f1: 0.8547,	 loss0.3369
+Test Epoch 104: 100%|██████████| 1748/1748 [00:59<00:00, 29.41it/s, loss=1.64]
+Test Epoch 104 ==> 	accuracy: 0.9517, 	precision: 0.9677, 	recall: 0.7782, 	specificity: 0.9937, 	f1: 0.8627, 	loss1.2902
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 105: 100%|██████████| 6137/6137 [08:21<00:00, 12.24it/s, loss=0.0174]
+Train Epoch 105 ==> 	accuracy: 0.8751, 	precision: 0.9996, 	recall: 0.7505, 	specificity: 0.9997, 	f1: 0.8573,	 loss0.3278
+Test Epoch 105: 100%|██████████| 1748/1748 [00:54<00:00, 32.11it/s, loss=1.98]
+Test Epoch 105 ==> 	accuracy: 0.9507, 	precision: 0.9698, 	recall: 0.7714, 	specificity: 0.9942, 	f1: 0.8593, 	loss1.3145
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 106: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.0275]
+Train Epoch 106 ==> 	accuracy: 0.8731, 	precision: 0.9997, 	recall: 0.7465, 	specificity: 0.9998, 	f1: 0.8547,	 loss0.3400
+Test Epoch 106: 100%|██████████| 1748/1748 [00:54<00:00, 32.05it/s, loss=0.169]
+Test Epoch 106 ==> 	accuracy: 0.9518, 	precision: 0.9675, 	recall: 0.7794, 	specificity: 0.9937, 	f1: 0.8633, 	loss1.2880
+Adjusting learning rate of group 0 to 1.8530e-05.
+Train Epoch 107: 100%|██████████| 6137/6137 [08:28<00:00, 12.07it/s, loss=0.006]
+Train Epoch 107 ==> 	accuracy: 0.8751, 	precision: 0.9997, 	recall: 0.7505, 	specificity: 0.9997, 	f1: 0.8573,	 loss0.3276
+Test Epoch 107: 100%|██████████| 1748/1748 [00:58<00:00, 29.89it/s, loss=0.134]
+Test Epoch 107 ==> 	accuracy: 0.9522, 	precision: 0.9669, 	recall: 0.7816, 	specificity: 0.9935, 	f1: 0.8645, 	loss1.3273
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 108: 100%|██████████| 6137/6137 [08:23<00:00, 12.18it/s, loss=0.0086]
+Train Epoch 108 ==> 	accuracy: 0.8728, 	precision: 0.9997, 	recall: 0.7459, 	specificity: 0.9998, 	f1: 0.8543,	 loss0.3385
+Test Epoch 108: 100%|██████████| 1748/1748 [00:59<00:00, 29.54it/s, loss=0.31]
+Test Epoch 108 ==> 	accuracy: 0.9522, 	precision: 0.9654, 	recall: 0.7830, 	specificity: 0.9932, 	f1: 0.8647, 	loss1.3872
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 109: 100%|██████████| 6137/6137 [08:28<00:00, 12.08it/s, loss=0.0441]
+Train Epoch 109 ==> 	accuracy: 0.8756, 	precision: 0.9997, 	recall: 0.7515, 	specificity: 0.9997, 	f1: 0.8580,	 loss0.3282
+Test Epoch 109: 100%|██████████| 1748/1748 [00:59<00:00, 29.28it/s, loss=0.161]
+Test Epoch 109 ==> 	accuracy: 0.9515, 	precision: 0.9690, 	recall: 0.7761, 	specificity: 0.9940, 	f1: 0.8619, 	loss1.2749
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 110: 100%|██████████| 6137/6137 [08:29<00:00, 12.05it/s, loss=0.0195]
+Train Epoch 110 ==> 	accuracy: 0.8749, 	precision: 0.9997, 	recall: 0.7501, 	specificity: 0.9998, 	f1: 0.8571,	 loss0.3333
+Test Epoch 110: 100%|██████████| 1748/1748 [00:59<00:00, 29.52it/s, loss=3.12]
+Test Epoch 110 ==> 	accuracy: 0.9508, 	precision: 0.9700, 	recall: 0.7715, 	specificity: 0.9942, 	f1: 0.8594, 	loss1.2409
+Adjusting learning rate of group 0 to 1.6677e-05.
+Train Epoch 111: 100%|██████████| 6137/6137 [08:26<00:00, 12.11it/s, loss=0.0089]
+Train Epoch 111 ==> 	accuracy: 0.8765, 	precision: 0.9996, 	recall: 0.7533, 	specificity: 0.9997, 	f1: 0.8592,	 loss0.3254
+Test Epoch 111: 100%|██████████| 1748/1748 [00:55<00:00, 31.33it/s, loss=0.146]
+Test Epoch 111 ==> 	accuracy: 0.9530, 	precision: 0.9616, 	recall: 0.7910, 	specificity: 0.9923, 	f1: 0.8680, 	loss1.5925
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 112: 100%|██████████| 6137/6137 [08:32<00:00, 11.97it/s, loss=0.0035]
+Train Epoch 112 ==> 	accuracy: 0.8757, 	precision: 0.9997, 	recall: 0.7516, 	specificity: 0.9998, 	f1: 0.8580,	 loss0.3300
+Test Epoch 112: 100%|██████████| 1748/1748 [00:59<00:00, 29.21it/s, loss=0.344]
+Test Epoch 112 ==> 	accuracy: 0.9517, 	precision: 0.9667, 	recall: 0.7794, 	specificity: 0.9935, 	f1: 0.8630, 	loss1.4482
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 113: 100%|██████████| 6137/6137 [08:25<00:00, 12.14it/s, loss=0.0071]
+Train Epoch 113 ==> 	accuracy: 0.8770, 	precision: 0.9997, 	recall: 0.7542, 	specificity: 0.9998, 	f1: 0.8598,	 loss0.3294
+Test Epoch 113: 100%|██████████| 1748/1748 [00:54<00:00, 31.97it/s, loss=0.154]
+Test Epoch 113 ==> 	accuracy: 0.9518, 	precision: 0.9687, 	recall: 0.7780, 	specificity: 0.9939, 	f1: 0.8629, 	loss1.4149
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 114: 100%|██████████| 6137/6137 [08:00<00:00, 12.78it/s, loss=0.009]
+Train Epoch 114 ==> 	accuracy: 0.8770, 	precision: 0.9997, 	recall: 0.7542, 	specificity: 0.9998, 	f1: 0.8598,	 loss0.3278
+Test Epoch 114: 100%|██████████| 1748/1748 [00:53<00:00, 32.61it/s, loss=1.51]
+Test Epoch 114 ==> 	accuracy: 0.9519, 	precision: 0.9667, 	recall: 0.7803, 	specificity: 0.9935, 	f1: 0.8636, 	loss1.4128
+Adjusting learning rate of group 0 to 1.5009e-05.
+Train Epoch 115: 100%|██████████| 6137/6137 [08:13<00:00, 12.43it/s, loss=0.0251]
+Train Epoch 115 ==> 	accuracy: 0.8787, 	precision: 0.9997, 	recall: 0.7576, 	specificity: 0.9998, 	f1: 0.8620,	 loss0.3204
+Test Epoch 115: 100%|██████████| 1748/1748 [00:55<00:00, 31.36it/s, loss=1.25]
+Test Epoch 115 ==> 	accuracy: 0.9523, 	precision: 0.9665, 	recall: 0.7826, 	specificity: 0.9934, 	f1: 0.8648, 	loss1.4259
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 116: 100%|██████████| 6137/6137 [08:14<00:00, 12.40it/s, loss=0.0141]
+Train Epoch 116 ==> 	accuracy: 0.8762, 	precision: 0.9997, 	recall: 0.7526, 	specificity: 0.9998, 	f1: 0.8587,	 loss0.3319
+Test Epoch 116: 100%|██████████| 1748/1748 [01:00<00:00, 29.11it/s, loss=1.01]
+Test Epoch 116 ==> 	accuracy: 0.9507, 	precision: 0.9700, 	recall: 0.7713, 	specificity: 0.9942, 	f1: 0.8593, 	loss1.2614
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 117: 100%|██████████| 6137/6137 [08:29<00:00, 12.04it/s, loss=0.0086]
+Train Epoch 117 ==> 	accuracy: 0.8780, 	precision: 0.9997, 	recall: 0.7563, 	specificity: 0.9998, 	f1: 0.8611,	 loss0.3235
+Test Epoch 117: 100%|██████████| 1748/1748 [00:59<00:00, 29.22it/s, loss=0.245]
+Test Epoch 117 ==> 	accuracy: 0.9520, 	precision: 0.9674, 	recall: 0.7805, 	specificity: 0.9936, 	f1: 0.8640, 	loss1.3731
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 118: 100%|██████████| 6137/6137 [08:27<00:00, 12.10it/s, loss=0.0025]
+Train Epoch 118 ==> 	accuracy: 0.8783, 	precision: 0.9997, 	recall: 0.7568, 	specificity: 0.9998, 	f1: 0.8615,	 loss0.3241
+Test Epoch 118: 100%|██████████| 1748/1748 [00:59<00:00, 29.46it/s, loss=3.25]
+Test Epoch 118 ==> 	accuracy: 0.9519, 	precision: 0.9657, 	recall: 0.7813, 	specificity: 0.9933, 	f1: 0.8638, 	loss1.4133
+Adjusting learning rate of group 0 to 1.3509e-05.
+Train Epoch 119: 100%|██████████| 6137/6137 [08:30<00:00, 12.01it/s, loss=0.0103]
+Train Epoch 119 ==> 	accuracy: 0.8766, 	precision: 0.9996, 	recall: 0.7535, 	specificity: 0.9997, 	f1: 0.8593,	 loss0.3275
+Test Epoch 119: 100%|██████████| 1748/1748 [00:56<00:00, 30.85it/s, loss=0.176]
+Test Epoch 119 ==> 	accuracy: 0.9526, 	precision: 0.9668, 	recall: 0.7838, 	specificity: 0.9935, 	f1: 0.8658, 	loss1.3199
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 120: 100%|██████████| 6137/6137 [08:29<00:00, 12.05it/s, loss=0.0227]
+Train Epoch 120 ==> 	accuracy: 0.8760, 	precision: 0.9996, 	recall: 0.7523, 	specificity: 0.9997, 	f1: 0.8585,	 loss0.3317
+Test Epoch 120: 100%|██████████| 1748/1748 [00:54<00:00, 32.26it/s, loss=3.16]
+Test Epoch 120 ==> 	accuracy: 0.9524, 	precision: 0.9682, 	recall: 0.7816, 	specificity: 0.9938, 	f1: 0.8649, 	loss1.2231
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 121: 100%|██████████| 6137/6137 [08:20<00:00, 12.25it/s, loss=0.023]
+Train Epoch 121 ==> 	accuracy: 0.8748, 	precision: 0.9996, 	recall: 0.7498, 	specificity: 0.9997, 	f1: 0.8569,	 loss0.3365
+Test Epoch 121: 100%|██████████| 1748/1748 [00:55<00:00, 31.56it/s, loss=0.178]
+Test Epoch 121 ==> 	accuracy: 0.9524, 	precision: 0.9679, 	recall: 0.7823, 	specificity: 0.9937, 	f1: 0.8652, 	loss1.2411
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 122: 100%|██████████| 6137/6137 [08:26<00:00, 12.12it/s, loss=0.0398]
+Train Epoch 122 ==> 	accuracy: 0.8764, 	precision: 0.9996, 	recall: 0.7532, 	specificity: 0.9997, 	f1: 0.8591,	 loss0.3242
+Test Epoch 122: 100%|██████████| 1748/1748 [00:59<00:00, 29.36it/s, loss=0.599]
+Test Epoch 122 ==> 	accuracy: 0.9527, 	precision: 0.9665, 	recall: 0.7847, 	specificity: 0.9934, 	f1: 0.8662, 	loss1.3144
+Adjusting learning rate of group 0 to 1.2158e-05.
+Train Epoch 123: 100%|██████████| 6137/6137 [08:25<00:00, 12.14it/s, loss=0.0222]
+Train Epoch 123 ==> 	accuracy: 0.8742, 	precision: 0.9996, 	recall: 0.7486, 	specificity: 0.9997, 	f1: 0.8561,	 loss0.3383
+Test Epoch 123: 100%|██████████| 1748/1748 [01:01<00:00, 28.32it/s, loss=0.0867]
+Test Epoch 123 ==> 	accuracy: 0.9520, 	precision: 0.9684, 	recall: 0.7794, 	specificity: 0.9938, 	f1: 0.8637, 	loss1.1860
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 124: 100%|██████████| 6137/6137 [08:31<00:00, 11.99it/s, loss=0.0273]
+Train Epoch 124 ==> 	accuracy: 0.8787, 	precision: 0.9997, 	recall: 0.7576, 	specificity: 0.9998, 	f1: 0.8620,	 loss0.3189
+Test Epoch 124: 100%|██████████| 1748/1748 [01:01<00:00, 28.52it/s, loss=0.125]
+Test Epoch 124 ==> 	accuracy: 0.9533, 	precision: 0.9655, 	recall: 0.7889, 	specificity: 0.9932, 	f1: 0.8683, 	loss1.3747
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 125: 100%|██████████| 6137/6137 [08:31<00:00, 11.99it/s, loss=0.0287]
+Train Epoch 125 ==> 	accuracy: 0.8761, 	precision: 0.9996, 	recall: 0.7525, 	specificity: 0.9997, 	f1: 0.8587,	 loss0.3356
+Test Epoch 125: 100%|██████████| 1748/1748 [00:57<00:00, 30.24it/s, loss=0.0823]
+Test Epoch 125 ==> 	accuracy: 0.9533, 	precision: 0.9656, 	recall: 0.7886, 	specificity: 0.9932, 	f1: 0.8682, 	loss1.3927
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 126: 100%|██████████| 6137/6137 [08:23<00:00, 12.19it/s, loss=0.009]
+Train Epoch 126 ==> 	accuracy: 0.8798, 	precision: 0.9997, 	recall: 0.7599, 	specificity: 0.9997, 	f1: 0.8635,	 loss0.3157
+Test Epoch 126: 100%|██████████| 1748/1748 [01:02<00:00, 27.98it/s, loss=0.163]
+Test Epoch 126 ==> 	accuracy: 0.9529, 	precision: 0.9657, 	recall: 0.7868, 	specificity: 0.9932, 	f1: 0.8671, 	loss1.3785
+Adjusting learning rate of group 0 to 1.0942e-05.
+Train Epoch 127: 100%|██████████| 6137/6137 [08:26<00:00, 12.11it/s, loss=0.0102]
+Train Epoch 127 ==> 	accuracy: 0.8779, 	precision: 0.9997, 	recall: 0.7560, 	specificity: 0.9997, 	f1: 0.8609,	 loss0.3284
+Test Epoch 127: 100%|██████████| 1748/1748 [00:59<00:00, 29.23it/s, loss=0.115]
+Test Epoch 127 ==> 	accuracy: 0.9531, 	precision: 0.9647, 	recall: 0.7885, 	specificity: 0.9930, 	f1: 0.8677, 	loss1.4794
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 128: 100%|██████████| 6137/6137 [08:19<00:00, 12.29it/s, loss=0.0311]
+Train Epoch 128 ==> 	accuracy: 0.8801, 	precision: 0.9997, 	recall: 0.7604, 	specificity: 0.9998, 	f1: 0.8638,	 loss0.3188
+Test Epoch 128: 100%|██████████| 1748/1748 [00:56<00:00, 31.21it/s, loss=0.906]
+Test Epoch 128 ==> 	accuracy: 0.9526, 	precision: 0.9656, 	recall: 0.7852, 	specificity: 0.9932, 	f1: 0.8661, 	loss1.5116
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 129: 100%|██████████| 6137/6137 [08:08<00:00, 12.57it/s, loss=0.0078]
+Train Epoch 129 ==> 	accuracy: 0.8782, 	precision: 0.9996, 	recall: 0.7567, 	specificity: 0.9997, 	f1: 0.8613,	 loss0.3276
+Test Epoch 129: 100%|██████████| 1748/1748 [00:55<00:00, 31.71it/s, loss=1.16]
+Test Epoch 129 ==> 	accuracy: 0.9521, 	precision: 0.9688, 	recall: 0.7794, 	specificity: 0.9939, 	f1: 0.8638, 	loss1.3118
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 130: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.0264]
+Train Epoch 130 ==> 	accuracy: 0.8804, 	precision: 0.9996, 	recall: 0.7611, 	specificity: 0.9997, 	f1: 0.8642,	 loss0.3175
+Test Epoch 130: 100%|██████████| 1748/1748 [01:00<00:00, 29.06it/s, loss=0.863]
+Test Epoch 130 ==> 	accuracy: 0.9531, 	precision: 0.9661, 	recall: 0.7871, 	specificity: 0.9933, 	f1: 0.8675, 	loss1.4343
+Adjusting learning rate of group 0 to 9.8477e-06.
+Train Epoch 131: 100%|██████████| 6137/6137 [08:31<00:00, 12.01it/s, loss=0.0133]
+Train Epoch 131 ==> 	accuracy: 0.8802, 	precision: 0.9997, 	recall: 0.7606, 	specificity: 0.9998, 	f1: 0.8639,	 loss0.3206
+Test Epoch 131: 100%|██████████| 1748/1748 [00:59<00:00, 29.34it/s, loss=0.371]
+Test Epoch 131 ==> 	accuracy: 0.9535, 	precision: 0.9623, 	recall: 0.7927, 	specificity: 0.9925, 	f1: 0.8693, 	loss1.5886
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 132: 100%|██████████| 6137/6137 [08:32<00:00, 11.97it/s, loss=0.0191]
+Train Epoch 132 ==> 	accuracy: 0.8804, 	precision: 0.9997, 	recall: 0.7611, 	specificity: 0.9997, 	f1: 0.8642,	 loss0.3202
+Test Epoch 132: 100%|██████████| 1748/1748 [00:58<00:00, 29.63it/s, loss=1.35]
+Test Epoch 132 ==> 	accuracy: 0.9527, 	precision: 0.9671, 	recall: 0.7841, 	specificity: 0.9935, 	f1: 0.8660, 	loss1.4161
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 133: 100%|██████████| 6137/6137 [08:33<00:00, 11.96it/s, loss=0.0069]
+Train Epoch 133 ==> 	accuracy: 0.8798, 	precision: 0.9997, 	recall: 0.7600, 	specificity: 0.9997, 	f1: 0.8635,	 loss0.3228
+Test Epoch 133: 100%|██████████| 1748/1748 [01:03<00:00, 27.63it/s, loss=2.75]
+Test Epoch 133 ==> 	accuracy: 0.9529, 	precision: 0.9665, 	recall: 0.7860, 	specificity: 0.9934, 	f1: 0.8670, 	loss1.4316
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 134: 100%|██████████| 6137/6137 [08:18<00:00, 12.30it/s, loss=0.0364]
+Train Epoch 134 ==> 	accuracy: 0.8800, 	precision: 0.9997, 	recall: 0.7603, 	specificity: 0.9998, 	f1: 0.8637,	 loss0.3190
+Test Epoch 134: 100%|██████████| 1748/1748 [00:50<00:00, 34.90it/s, loss=0.667]
+Test Epoch 134 ==> 	accuracy: 0.9521, 	precision: 0.9689, 	recall: 0.7795, 	specificity: 0.9939, 	f1: 0.8640, 	loss1.2877
+Adjusting learning rate of group 0 to 8.8629e-06.
+Train Epoch 135: 100%|██████████| 6137/6137 [08:22<00:00, 12.21it/s, loss=0.0101]
+Train Epoch 135 ==> 	accuracy: 0.8803, 	precision: 0.9997, 	recall: 0.7608, 	specificity: 0.9997, 	f1: 0.8640,	 loss0.3233
+Test Epoch 135: 100%|██████████| 1748/1748 [00:58<00:00, 29.83it/s, loss=0.145]
+Test Epoch 135 ==> 	accuracy: 0.9534, 	precision: 0.9631, 	recall: 0.7913, 	specificity: 0.9927, 	f1: 0.8688, 	loss1.5077
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 136: 100%|██████████| 6137/6137 [08:21<00:00, 12.24it/s, loss=0.0123]
+Train Epoch 136 ==> 	accuracy: 0.8814, 	precision: 0.9997, 	recall: 0.7630, 	specificity: 0.9998, 	f1: 0.8655,	 loss0.3156
+Test Epoch 136: 100%|██████████| 1748/1748 [00:56<00:00, 30.68it/s, loss=0.492]
+Test Epoch 136 ==> 	accuracy: 0.9535, 	precision: 0.9640, 	recall: 0.7912, 	specificity: 0.9928, 	f1: 0.8691, 	loss1.4982
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 137: 100%|██████████| 6137/6137 [08:13<00:00, 12.43it/s, loss=0.012]
+Train Epoch 137 ==> 	accuracy: 0.8807, 	precision: 0.9997, 	recall: 0.7616, 	specificity: 0.9998, 	f1: 0.8645,	 loss0.3218
+Test Epoch 137: 100%|██████████| 1748/1748 [00:56<00:00, 30.82it/s, loss=0.125]
+Test Epoch 137 ==> 	accuracy: 0.9536, 	precision: 0.9633, 	recall: 0.7924, 	specificity: 0.9927, 	f1: 0.8695, 	loss1.5132
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 138: 100%|██████████| 6137/6137 [08:09<00:00, 12.54it/s, loss=0.0104]
+Train Epoch 138 ==> 	accuracy: 0.8825, 	precision: 0.9997, 	recall: 0.7652, 	specificity: 0.9997, 	f1: 0.8669,	 loss0.3157
+Test Epoch 138: 100%|██████████| 1748/1748 [00:57<00:00, 30.50it/s, loss=0.326]
+Test Epoch 138 ==> 	accuracy: 0.9534, 	precision: 0.9632, 	recall: 0.7912, 	specificity: 0.9927, 	f1: 0.8688, 	loss1.5197
+Adjusting learning rate of group 0 to 7.9766e-06.
+Train Epoch 139: 100%|██████████| 6137/6137 [08:22<00:00, 12.21it/s, loss=0.0151]
+Train Epoch 139 ==> 	accuracy: 0.8809, 	precision: 0.9997, 	recall: 0.7621, 	specificity: 0.9997, 	f1: 0.8649,	 loss0.3208
+Test Epoch 139: 100%|██████████| 1748/1748 [00:55<00:00, 31.45it/s, loss=0.436]
+Test Epoch 139 ==> 	accuracy: 0.9533, 	precision: 0.9658, 	recall: 0.7886, 	specificity: 0.9932, 	f1: 0.8683, 	loss1.3379
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 140: 100%|██████████| 6137/6137 [08:22<00:00, 12.22it/s, loss=0.0091]
+Train Epoch 140 ==> 	accuracy: 0.8798, 	precision: 0.9996, 	recall: 0.7599, 	specificity: 0.9997, 	f1: 0.8634,	 loss0.3212
+Test Epoch 140: 100%|██████████| 1748/1748 [00:59<00:00, 29.53it/s, loss=0.594]
+Test Epoch 140 ==> 	accuracy: 0.9532, 	precision: 0.9654, 	recall: 0.7886, 	specificity: 0.9932, 	f1: 0.8681, 	loss1.3650
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 141: 100%|██████████| 6137/6137 [08:26<00:00, 12.12it/s, loss=0.0689]
+Train Epoch 141 ==> 	accuracy: 0.8802, 	precision: 0.9996, 	recall: 0.7607, 	specificity: 0.9997, 	f1: 0.8640,	 loss0.3193
+Test Epoch 141: 100%|██████████| 1748/1748 [00:57<00:00, 30.16it/s, loss=0.353]
+Test Epoch 141 ==> 	accuracy: 0.9534, 	precision: 0.9634, 	recall: 0.7915, 	specificity: 0.9927, 	f1: 0.8690, 	loss1.4345
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 142: 100%|██████████| 6137/6137 [08:28<00:00, 12.06it/s, loss=0.0107]
+Train Epoch 142 ==> 	accuracy: 0.8801, 	precision: 0.9997, 	recall: 0.7604, 	specificity: 0.9998, 	f1: 0.8637,	 loss0.3235
+Test Epoch 142: 100%|██████████| 1748/1748 [01:00<00:00, 28.77it/s, loss=0.0931]
+Test Epoch 142 ==> 	accuracy: 0.9532, 	precision: 0.9633, 	recall: 0.7903, 	specificity: 0.9927, 	f1: 0.8683, 	loss1.4758
+Adjusting learning rate of group 0 to 7.1790e-06.
+Train Epoch 143: 100%|██████████| 6137/6137 [08:36<00:00, 11.89it/s, loss=0.0191]
+Train Epoch 143 ==> 	accuracy: 0.8814, 	precision: 0.9997, 	recall: 0.7631, 	specificity: 0.9997, 	f1: 0.8655,	 loss0.3125
+Test Epoch 143: 100%|██████████| 1748/1748 [00:59<00:00, 29.62it/s, loss=1.97]
+Test Epoch 143 ==> 	accuracy: 0.9535, 	precision: 0.9616, 	recall: 0.7931, 	specificity: 0.9923, 	f1: 0.8693, 	loss1.5278
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 144: 100%|██████████| 6137/6137 [08:16<00:00, 12.36it/s, loss=0.022]
+Train Epoch 144 ==> 	accuracy: 0.8799, 	precision: 0.9997, 	recall: 0.7601, 	specificity: 0.9997, 	f1: 0.8636,	 loss0.3212
+Test Epoch 144: 100%|██████████| 1748/1748 [00:56<00:00, 31.02it/s, loss=5.31]
+Test Epoch 144 ==> 	accuracy: 0.9536, 	precision: 0.9636, 	recall: 0.7919, 	specificity: 0.9928, 	f1: 0.8694, 	loss1.4542
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 145: 100%|██████████| 6137/6137 [08:17<00:00, 12.34it/s, loss=0.127]
+Train Epoch 145 ==> 	accuracy: 0.8826, 	precision: 0.9997, 	recall: 0.7654, 	specificity: 0.9998, 	f1: 0.8670,	 loss0.3134
+Test Epoch 145: 100%|██████████| 1748/1748 [00:58<00:00, 29.77it/s, loss=3.14]
+Test Epoch 145 ==> 	accuracy: 0.9536, 	precision: 0.9628, 	recall: 0.7928, 	specificity: 0.9926, 	f1: 0.8696, 	loss1.5384
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 146: 100%|██████████| 6137/6137 [08:29<00:00, 12.04it/s, loss=0.0047]
+Train Epoch 146 ==> 	accuracy: 0.8824, 	precision: 0.9997, 	recall: 0.7651, 	specificity: 0.9998, 	f1: 0.8668,	 loss0.3158
+Test Epoch 146: 100%|██████████| 1748/1748 [00:56<00:00, 30.95it/s, loss=0.103]
+Test Epoch 146 ==> 	accuracy: 0.9538, 	precision: 0.9616, 	recall: 0.7947, 	specificity: 0.9923, 	f1: 0.8702, 	loss1.6439
+Adjusting learning rate of group 0 to 6.4611e-06.
+Train Epoch 147: 100%|██████████| 6137/6137 [08:15<00:00, 12.40it/s, loss=0.0032]
+Train Epoch 147 ==> 	accuracy: 0.8841, 	precision: 0.9997, 	recall: 0.7683, 	specificity: 0.9998, 	f1: 0.8689,	 loss0.3104
+Test Epoch 147: 100%|██████████| 1748/1748 [00:58<00:00, 29.80it/s, loss=0.433]
+Test Epoch 147 ==> 	accuracy: 0.9541, 	precision: 0.9618, 	recall: 0.7965, 	specificity: 0.9923, 	f1: 0.8714, 	loss1.6556
+Adjusting learning rate of group 0 to 5.8150e-06.
+Train Epoch 148: 100%|██████████| 6137/6137 [08:14<00:00, 12.40it/s, loss=0.0112]
+Train Epoch 148 ==> 	accuracy: 0.8845, 	precision: 0.9997, 	recall: 0.7692, 	specificity: 0.9998, 	f1: 0.8694,	 loss0.3100
+Test Epoch 148: 100%|██████████| 1748/1748 [00:53<00:00, 32.96it/s, loss=0.111]
+Test Epoch 148 ==> 	accuracy: 0.9542, 	precision: 0.9598, 	recall: 0.7986, 	specificity: 0.9919, 	f1: 0.8718, 	loss1.7450
+Adjusting learning rate of group 0 to 5.8150e-06.
+Train Epoch 149: 100%|██████████| 6137/6137 [08:24<00:00, 12.17it/s, loss=0.0292]
+Train Epoch 149 ==> 	accuracy: 0.8840, 	precision: 0.9997, 	recall: 0.7682, 	specificity: 0.9998, 	f1: 0.8688,	 loss0.3113
+Test Epoch 149: 100%|██████████| 1748/1748 [01:00<00:00, 28.75it/s, loss=0.227]
+Test Epoch 149 ==> 	accuracy: 0.9542, 	precision: 0.9604, 	recall: 0.7982, 	specificity: 0.9920, 	f1: 0.8718, 	loss1.7558
 Adjusting learning rate of group 0 to 5.8150e-06.
 
 进程已结束，退出代码为 0

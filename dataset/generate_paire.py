@@ -44,7 +44,7 @@ def process_file(file, pos_dir, neg_dir, pos_workspace, neg_workspace, kmer, gen
 
 
 def combine_part(dir, target):
-    files = os.listdir(dir)
+    files = sorted(os.listdir(dir))
     all_data = dict()
     for file in files:
         if file.endswith('.npz'):
@@ -76,7 +76,7 @@ def generate_pair(pos_dir, neg_dir, save_dir, kmer, epoch=0, n_threads=8):
     all_pos_exist = os.path.exists(pos_file)
     try:
 
-        files = os.listdir(pos_dir)
+        files = sorted(os.listdir(pos_dir))
 
         with ThreadPoolExecutor(max_workers=n_threads) as executor:
             futures = []

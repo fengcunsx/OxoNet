@@ -147,21 +147,21 @@ def prediction(args: argparse.Namespace):
     # df.append(info_df)
     static = pd.concat(static, axis=1).reset_index(drop=True)
     df = pd.concat([info_df, static, embeds], axis=1)
-    df.to_csv(os.path.join(args.save_dir, 'info_test.csv'), index=False)
+    df.to_csv(os.path.join(args.save_dir, 'info_test_ab.csv'), index=False)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', type=str,
-                        default='../model_save_sigBlock4_focalWithMs_deformable_7mer_ab_multConv/model_148.pth')
+                        default='../random42_ab_seq/model_120.pth')
     parser.add_argument('--generate', default=True)
-    parser.add_argument('--test-pos-dir', type=str, default='/home/bio/8oxog/data/7mer_feature/8oxog_valid_test/test')
-    parser.add_argument('--test-neg-dir', type=str, default='/home/bio/8oxog/data/7mer_feature/g_valid_test/test')
+    parser.add_argument('--test-pos-dir', type=str, default='/home/bio/8oxog/data/feature/8oxog_valid_test/test')
+    parser.add_argument('--test-neg-dir', type=str, default='/home/bio/8oxog/data/feature/g_valid_test/test')
     parser.add_argument('--test-work-dir', type=str, default='/home/bio/8oxog/data/feature/test_workspace')
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--threshold', type=float, default=0.5)
     parser.add_argument('--num-workers', type=int, default=8)
-    parser.add_argument('--save-dir', type=str, default='../threshold/7mer_feature/7mer_multConv')
+    parser.add_argument('--save-dir', type=str, default='../random42_ab_seq')
     args = parser.parse_args()
     with torch.no_grad():
         prediction(args)

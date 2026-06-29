@@ -375,12 +375,12 @@ class SignalBlock(nn.Module):
             LongRangeSignal(input_dim=input_dim, mha_head=mha_head, dp=mha_dp),
         )
 
-        # self.local_sig = ResidualConnect(
-        #     module=SignalBlockConvModule(
-        #         in_channels=input_dim,
-        #         dropout_p=conv_dropout_p,
-        #     ),
-        # )
+        self.local_sig = ResidualConnect(
+            module=SignalBlockConvModule(
+                in_channels=input_dim,
+                dropout_p=conv_dropout_p,
+            ),
+        )
 
         self.post_conv = ResidualConnect(DeformableConvModule(in_channels=input_dim,
                                                               out_channels=input_dim,
@@ -405,11 +405,11 @@ class SignalBlock(nn.Module):
         self.normal = nn.LayerNorm(input_dim)
 
     def forward(self, x, mask=None):
-        # out = self.local_sig(x, mask)
-        # out = self.global_sig(out, mask.bool())
-        #
-        out = self.global_sig(x, mask.bool())
-        #
+        out = self.local_sig(x, mask)
+        out = self.global_sig(out, mask.bool())
+
+        # out = self.global_sig(x, mask.bool())
+
         out = self.post_conv(out, mask)
         out = self.ffn(out, mask)
         out = self.normal(out)

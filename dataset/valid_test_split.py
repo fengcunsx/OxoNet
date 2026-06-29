@@ -60,8 +60,8 @@ def split_npz_by_attr(dir_path: str, attr_key: str, save_dir: str, random_state=
 
 
 if __name__ == '__main__':
-    dir_path = '/home/bio/8oxog/data/feature/8oxog_test'
-    save_dir = '/home/bio/8oxog/data/feature/8oxog_valid_test'
+    dir_path = '/home/bio/8oxog/data/7mer_feature/g_test'
+    save_dir = '/home/bio/8oxog/data/7mer_feature/g_valid_test'
     split_npz_by_attr(dir_path, 'kmers', save_dir)
 
 # 示例调用
