@@ -13,7 +13,7 @@ recall alone may not lead to reliable biological findings."
   3. PPV = π·recall / [π·recall + (1−π)·FPR]，FDR = 1 − PPV。
   4. **FPR=1e-6 档已删除**：test_t2t 仅 1.94M 阴性，该档阈值由约 2 个阴性决定
      （半分裂偏差 112–218%）。1e-5 档仅约 19 个事件，必须带 CI。
-  5. **报告的 FPR 是上界**：基因组阴性集来自真实人类 DNA，本身含约 75/百万的真实
+  5. **基因组阴性是操作性阴性**：来自 Fpg 修复过的文库，按方案而非逐位点验证判为阴性。
      8-oxo-dG，故 FPR 收到 ~1e-4 以下时，计入的"假阳"里混有真损伤。这个下限与样本量无关。
 
     /home/bio/anaconda3/bin/python ppv_fdr.py
@@ -29,7 +29,7 @@ MODELS = {
     'OxoNet': '/home/bio/8oxog/wtl1/pack_scores_e2ep125',
     'esox': '/home/bio/8oxog/wtl1/pack_scores_esox',
     'NanoCon': '/home/bio/8oxog/nanocon/scores',
-    'GBDT(天花板)': '/home/bio/8oxog/nanocon',
+    'GBDT control': '/home/bio/8oxog/nanocon',
 }
 FPR_GRID = (1e-3, 1e-4, 1e-5)          # 1e-6 已删: 低于分辨力
 TRUE_BACKGROUND = 7.5e-5               # esox 实测基因组本底 ~75/百万
@@ -70,7 +70,7 @@ def main():
     L = ['真实丰度下的 PPV / FDR（答 R2.M2）',
          '  阈值来源: valid 的基因组阴性 {:,} 个位点(分辨力 {:.2e})'.format(n_valid_g, 1.0 / n_valid_g),
          '  recall: test_oligo 阳性 | FPR: test_t2t 基因组阴性上**实测**(带 Poisson 95% CI)',
-         '  ⚠ FPR 为上界: 基因组阴性含约 75/百万真实 8-oxo-dG',
+         '  注: 基因组阴性是操作性阴性(Fpg 修复), 非逐位点验证',
          '']
     header = ('{:12s} {:>11s} {:>8s} {:>8s} {:>10s} {:>21s} {:>9s} {:>9s} {:>9s}'.format(
         'model', '工作点', 'thr', 'recall', '实测FPR', 'FPR 95% CI', 'PPV@1', 'PPV@75', 'PPV@100'))
@@ -107,7 +107,12 @@ def main():
 
         # 要达到 target-ppv @ target-prev 需要多严的 FPR / 还剩多少 recall
         pi, tp = args.target_prev, args.target_ppv
-        need_fpr = pi * (1 - tp) / (tp * (1 - pi))
+        # 注意: 这个量是 f/r 的上界, 不是 f 的上界。
+    # PPV = pi*r / (pi*r + (1-pi)*f) >= q  <=>  f/r <= pi(1-q)/(q(1-pi))
+    # 早先版本把它当成固定 FPR 直接取阈值, 相当于假设 recall=1, 那是错的。
+    # 论文中的 fixed-PPV 结果改为在 valid 上按完整 PPV 约束选阈值(见 README)。
+    fpr_over_recall_cap = pi * (1 - tp) / (tp * (1 - pi))
+    need_fpr = fpr_over_recall_cap   # 保留变量名以兼容下游打印; 仅作参考上界
         if need_fpr < 1.0 / n_valid_g:
             note = 'FPR 需 <{:.2e}, 低于 valid 基因组阴性的分辨力(1/{:,})'.format(need_fpr, n_valid_g)
         else:
@@ -121,7 +126,7 @@ def main():
         L.append('')
 
     L += ['注 1: 审稿人假设的 1/百万 本底下, 所有方法单分子 PPV 都 <20% —— 这一点他说得对;',
-          '      但 esox 实测的真实本底是 ~75/百万, PPV@75 才是现实工作条件。',
+          '      75/百万是 esox 论文的 model-derived call rate, 不是实测丰度, 仅作情景假设。',
           '注 2: 本数据集覆盖度 ~0.16x(151 f5)/~1x(全量 959 f5), 位点级 k-of-n 聚合需 >=5x,',
           '      即每样本约 5,000 个 f5 = 5 张 flow cell → 该数据集不可行, 上表均为**单分子** PPV。',
           '注 3: FPR=1e-6 档已删除(阈值由约 2 个阴性决定); 事件数 <50 的行已标注 [n=..]。']

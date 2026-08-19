@@ -33,7 +33,16 @@ three subsets are pairwise disjoint, which is the property the paper's leakage c
 - `pos_train_ctx.json` — the 100 guanine-centred 5-mer contexts that delimit which sites are
   interrogated at all.
 
+## Environment
+
+`requirements.txt` records the environment that produced the released weights (Python 3.11,
+PyTorch 2.1.2+cu121). The two baselines run in their own environments with mutually incompatible
+PyTorch versions; the file lists those too, together with the upstream repositories.
+
 ## Reproducing the ablation and reproducibility tables without a GPU
+
+Run `python reproduce_tables.py`. It reads only `predictions/` and `manifests/` and prints the
+recall columns of Tables 7 and 8 of the paper. No GPU, no weights and no raw data are needed.
 
 `predictions/` holds the scored probability of every arm on `test_oligo` and `test_t2t`, aligned
 row-for-row with `manifests/sites_test_*.csv.gz`. Combined with `manifests/valid_thresholds.json`
@@ -50,6 +59,12 @@ recall = (p[lab == 1] >= th['full_seed42_ep125']['T@1e-04']).mean()   # -> 0.559
 We release these rather than the weights of the five ablation arms: the arms exist to justify
 numbers in the paper, and the predictions let anyone verify those numbers directly, which the
 weights alone would not.
+
+Not everything in the paper can be recomputed from this repository alone. The tables that involve
+esox or NanoCon need those methods' own environments and released models; the native analyses need
+the raw FAST5 data and the full basecalling and resquiggling pipeline. What is self-contained here
+is the OxoNet side: architecture, the checkpoint used throughout, the exact evaluated sites, the
+thresholds, and every arm's predictions.
 
 ## Operating-point convention
 
