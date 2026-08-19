@@ -1,0 +1,84 @@
+# OxoNet
+
+Code, trained weights and reproduction manifests for **"OxoNet: A Hybrid Deep Learning
+Network for High-Specificity Detection of 8-oxo-dG from Nanopore Signals, with Evaluation
+on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-2026-24892).
+
+> The tag `v1.0-resubmission` is the immutable snapshot corresponding to the submitted
+> manuscript. `main` may continue to receive documentation and bug fixes.
+
+## What is here
+
+| Path | Contents |
+|---|---|
+| `model/` | OxoNet architecture (Sig-Net, Seq-Net, cross-attention fusion) |
+| `scripts/` | Training, epoch selection, prediction |
+| `scripts/analysis/` | Every script that produces a table or figure in the paper |
+| `scripts/nanocon_bench/` | NanoCon baseline: scoring and CSV conversion |
+| `scripts/train_curves/` | Per-epoch training/validation logs for all seeds and ablation arms |
+| `manifests/` | Split manifests and the exact evaluated sites (see below) |
+| `weights/` | `oxonet_seed42_ep125.pth` — the model used throughout the paper (seed 42, epoch 125, selected on the validation set by recall under a strict-specificity constraint). `nanocon_baseline_ep29.ckpt` — our retrained NanoCon baseline |
+| `predictions/` | Scored probabilities of every seed and every ablation arm on both test sets |
+
+## Reproduction manifests
+
+`manifests/sites_{valid,test_oligo,test_t2t}.csv.gz` list every evaluated site as
+`(read_id, basecall_pos, label)`. These define the split exactly: the read-id sets of the
+three subsets are pairwise disjoint, which is the property the paper's leakage check verifies.
+
+- `valid_genomic_neg_mask.npy` — boolean mask marking which validation negatives are genomic
+  (as opposed to synthetic). **All decision thresholds in the paper are fixed on these**, never
+  on test data.
+- `valid_thresholds.json` — the thresholds and validation recalls per arm and operating point.
+- `pos_train_ctx.json` — the 100 guanine-centred 5-mer contexts that delimit which sites are
+  interrogated at all.
+
+## Reproducing the ablation and reproducibility tables without a GPU
+
+`predictions/` holds the scored probability of every arm on `test_oligo` and `test_t2t`, aligned
+row-for-row with `manifests/sites_test_*.csv.gz`. Combined with `manifests/valid_thresholds.json`
+this is enough to recompute Tables 7 and 8 exactly — no weights, no GPU, no re-training:
+
+```python
+import numpy as np, json
+th = json.load(open('manifests/valid_thresholds.json'))
+lab = np.loadtxt('manifests/sites_test_t2t.csv.gz', delimiter=',', skiprows=1, usecols=2)
+p   = np.load('predictions/probs_full_seed42_ep125_test_t2t.npy')
+recall = (p[lab == 1] >= th['full_seed42_ep125']['T@1e-04']).mean()   # -> 0.5590
+```
+
+We release these rather than the weights of the five ablation arms: the arms exist to justify
+numbers in the paper, and the predictions let anyone verify those numbers directly, which the
+weights alone would not.
+
+## Operating-point convention
+
+Results are reported at a **matched false-positive rate on held-out genomic negatives**
+(primary: 1e-4), not at a probability threshold. `FPR = 1e-6` is never reported: the negative
+set is too small to resolve it. See Section IV-F of the paper.
+
+## Loading the model
+
+```python
+from model.model import DetectModel
+import torch
+
+m = DetectModel(dim=128, sig_blocks=4, sig_l=175, seq_l=7, pos_mode='rope').eval()
+m.load_state_dict(torch.load('weights/oxonet_seed42_ep125.pth', map_location='cpu'))
+```
+
+## Note on sequence width
+
+Seq-Net consumes the full **7-mer** (`seq_l=7`); the central 5-mer is used only to define the
+100 interrogated contexts. Instantiating `DetectModel(..., seq_l=5)` gives a different, smaller
+model that was never trained.
+
+## Data
+
+Sequencing data are third-party and not redistributed here. Accessions are listed in the
+paper's Data Availability Statement (ENA `PRJEB76712` for the synthetic and native runs;
+the NA12878 genomic negatives are from the Nanopore WGS Consortium release 6).
+
+## License
+
+MIT (see `LICENSE`). If you use this work, please cite the paper — see `CITATION.cff`.

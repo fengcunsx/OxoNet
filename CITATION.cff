@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "OxoNet: high-specificity detection of 8-oxo-dG from nanopore signals"
+authors:
+  - family-names: Wang
+    given-names: Mingkai
+    affiliation: "North China Electric Power University"
+repository-code: "https://github.com/fengcunsx/OxoNet"
+license: MIT
+preferred-citation:
+  type: article
+  title: "OxoNet: A Hybrid Deep Learning Network for High-Specificity Detection of 8-oxo-dG from Nanopore Signals, with Evaluation on Genomic Negatives and Native Human DNA"
+  authors:
+    - family-names: Wang
+      given-names: Mingkai
+  journal: "IEEE Access"
+  year: 2026
+  notes: "Manuscript Access-2026-24892, under review."
