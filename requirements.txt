@@ -1,14 +1,30 @@
-# OxoNet — inference / analysis environment (the one that produced the released weights)
-# Python 3.11, CUDA 12.1
-torch==2.1.2+cu121          # --index-url https://download.pytorch.org/whl/cu121
-numpy>=1.24,<2.0
-scipy>=1.10
-scikit-learn>=1.3
-matplotlib>=3.7
-pandas>=2.0
+# OxoNet — the environment that produced the released weights.
+# Python 3.11, CUDA 12.1.  Versions are read off that environment rather than
+# recalled.  Install with:
+#
+#     pip install -r requirements.txt
+#
+# The CPU-only self-tests (smoke_test.py, reproduce_tables.py,
+# verify_read_disjoint.py) need only torch and numpy and run under any recent
+# torch; the pinned CUDA build below is not required for them.
+--extra-index-url https://download.pytorch.org/whl/cu121
 
-# Baselines are run in their own environments (mutually incompatible torch versions):
+torch==2.1.2+cu121
+numpy==1.26.4
+scipy==1.11.4
+scikit-learn==1.2.2
+pandas==2.1.4
+matplotlib==3.8.0
+tqdm==4.66.5
+pytorch-metric-learning==2.9.0   # train.py: losses / miners / samplers
+tensorboard==2.17.1              # training curves consumed by the figure scripts
+h5py==3.11.0                     # fast5 access during feature extraction
+
+# Baselines run in their own environments (mutually incompatible torch versions):
 #   esox     : torch 1.13.1+cu117, numba          -- https://github.com/marcpaga/esox
 #   NanoCon  : torch 1.13.0+cu117, pytorch_lightning==1.7.1, transformers==4.6.1
 #              -- https://github.com/Challis-lab/NanoCon
-# Feature extraction additionally needs ont-tombo and Guppy 6.3.8 (dna_r9.4.1_450bps_sup).
+#
+# Feature extraction additionally needs Guppy 6.3.8 (dna_r9.4.1_450bps_sup.cfg),
+# ont-tombo 1.5.1 and minimap2 2.24-r1122.  These are not pip-installable and
+# are not exercised by any of the self-tests.

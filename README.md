@@ -4,10 +4,15 @@ Code, trained weights and reproduction manifests for **"OxoNet: A Hybrid Deep Le
 Network for High-Specificity Detection of 8-oxo-dG from Nanopore Signals, with Evaluation
 on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-2026-24892).
 
-> The tag `v1.2-resubmission` is the immutable snapshot corresponding to the submitted
+> The tag `v1.3-resubmission` is the immutable snapshot corresponding to the submitted
 > manuscript. `main` may continue to receive documentation and bug fixes.
-> (`v1.0` and `v1.1` are earlier snapshots and contain known defects: inference entry points
-> instantiated with a 5-base sequence input, and a missing dataset package.)
+>
+> Earlier tags are kept for provenance but should not be used. `v1.0` and `v1.1` instantiate
+> the inference entry points with a 5-base sequence input, which was never trained, and are
+> missing the `dataset` package. `v1.2` fixes the architecture but leaves the entry points
+> themselves broken: the model was never moved to the compute device, the CPU branch built an
+> invalid `torch.device("")`, and the 7-mer input was silently trimmed to its central 5-mer.
+> Every inference path now goes through `model/loader.py`, and `smoke_test.py` exercises it.
 
 ## What is here
 
@@ -17,7 +22,7 @@ on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-202
 | `scripts/` | Training, epoch selection, prediction |
 | `scripts/analysis/` | Every script that produces a table or figure in the paper |
 | `scripts/nanocon_bench/` | NanoCon baseline: scoring and CSV conversion |
-| `scripts/train_curves/` | Per-epoch training/validation logs for all seeds and ablation arms |
+| `scripts/train_curves/` | Per-epoch logs: OxoNet seeds 42/0/3407 and all five ablation arms (`*.tsv`), plus the three NanoCon-7 runs as TensorBoard event files |
 | `manifests/` | Split manifests and the exact evaluated sites (see below) |
 | `weights/` | `oxonet_seed42_ep125.pth` — the model used throughout the paper (seed 42, epoch 125, selected on the validation set by recall under a strict-specificity constraint). `nanocon_baseline_ep29.ckpt` — our retrained NanoCon baseline |
 | `predictions/` | Scored probabilities of every seed and every ablation arm on both test sets |
@@ -25,8 +30,26 @@ on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-202
 ## Reproduction manifests
 
 `manifests/sites_{valid,test_oligo,test_t2t}.csv.gz` list every evaluated site as
-`(read_id, basecall_pos, label)`. These define the split exactly: the read-id sets of the
-three subsets are pairwise disjoint, which is the property the paper's leakage check verifies.
+`(read_id, basecall_pos, label)`; `manifests/reads_*.txt.gz` give the same read IDs as sorted
+one-per-line lists.
+
+**Checking the split for leakage.** Run `python verify_read_disjoint.py` (CPU, seconds). It
+reports three layers of evidence separately rather than collapsing them, because they are not
+equally direct:
+
+- *exact* — the training positives are enumerated (`reads_train_pos.txt.gz`, 454,984 reads,
+  taken from the array that was fed to the model). Their intersection with validation,
+  test-oligo and test-genomic is 0, 0, 0.
+- *by construction* — the training **negatives cannot be enumerated**: the packed negative
+  training arrays kept only signal and summary features, and the intermediate per-read files
+  were deleted after packing. Their disjointness follows instead from `split_manifest.json`
+  and `dataset/build_split.py`: whole FAST5 directories and whole npz parts are assigned to one
+  split *before any read is opened*, and a read lives in exactly one such file. This covers
+  every read, including unarchived ones — which enumeration never could.
+- *independent* — a later 13-mer extraction over the same partition did keep read IDs and also
+  gives 0, 0, 0. It is corroboration, not provenance: it drops 540 reads the 7-mer build kept
+  and adds 420 it did not, because the two extractions apply different gap filters. It needs
+  the 43 GB 13-mer archive, which is not redistributed, and is skipped when absent.
 
 - `valid_genomic_neg_mask.npy` — a **heuristically inferred** genomic-enriched validation mask. The
   packed validation data does not record the origin of each negative, so a negative is treated as
@@ -51,7 +74,19 @@ Run `python reproduce_tables.py`. It reads only `predictions/` and `manifests/` 
 recall columns of Tables 7 and 8 of the paper. No GPU, no weights and no raw data are needed.
 
 Run `python smoke_test.py` to check that the released checkpoint loads strictly into the 7-mer
-architecture and produces a forward pass. Also CPU-only.
+architecture, produces a forward pass, and does so through `model.loader.build_model` — the code
+path `scripts/` actually uses. Also CPU-only.
+
+Run `python verify_read_disjoint.py` for the split audit described above.
+
+A release is considered acceptable only when all four of these pass in a fresh clone:
+
+```bash
+python -m compileall -q .   # every file parses
+python smoke_test.py        # checkpoint + entry point
+python verify_read_disjoint.py
+python reproduce_tables.py  # numbers match the paper
+```
 
 `scripts/analysis/make_figures.py` regenerates the figures, but it reads scoring outputs from paths
 on the machine where the analyses were run; it is released for inspection of how each figure was
@@ -88,12 +123,15 @@ set is too small to resolve it. See Section IV-F of the paper.
 ## Loading the model
 
 ```python
-from model.model import DetectModel
-import torch
+from model.loader import build_model
 
-m = DetectModel(dim=128, sig_blocks=4, sig_l=175, seq_l=7, pos_mode='rope').eval()
-m.load_state_dict(torch.load('weights/oxonet_seed42_ep125.pth', map_location='cpu'))
+model, device = build_model('weights/oxonet_seed42_ep125.pth')
 ```
+
+`build_model` is the only supported way in: it fixes the architecture at `seq_l=7` with RoPE,
+loads with `strict=True`, moves the model to a valid device and calls `eval()`. It accepts the
+three checkpoint layouts this project has produced (bare `state_dict`, `{'model': ...}`,
+`{'model_state_dict': ...}`); the released weights are the first.
 
 ## Note on sequence width
 

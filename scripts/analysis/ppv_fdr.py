@@ -105,27 +105,42 @@ def main():
                      .format(m, tag, thr, r, f, flo, fhi,
                              ppv(1e-6, r, f), ppv(7.5e-5, r, f), ppv(1e-4, r, f), flag))
 
-        # 要达到 target-ppv @ target-prev 需要多严的 FPR / 还剩多少 recall
+        # 要达到 target-ppv @ target-prev: 需要多严的工作点 / 还剩多少 recall
+        #
+        # PPV = pi*r / (pi*r + (1-pi)*f) >= q   <=>   f/r <= pi(1-q)/(q(1-pi))
+        #
+        # 约束的是**比值 f/r**, 不是 f 本身。早先的版本把右边当成固定 FPR 直接取
+        # 分位数, 等价于隐含假设 recall=1, 会高估达标时的 recall。这里改为在 valid
+        # 上按完整约束扫阈值: 从松到严取第一个满足 f/r <= cap 的点。
         pi, tp = args.target_prev, args.target_ppv
-        # 注意: 这个量是 f/r 的上界, 不是 f 的上界。
-    # PPV = pi*r / (pi*r + (1-pi)*f) >= q  <=>  f/r <= pi(1-q)/(q(1-pi))
-    # 早先版本把它当成固定 FPR 直接取阈值, 相当于假设 recall=1, 那是错的。
-    # 论文中的 fixed-PPV 结果改为在 valid 上按完整 PPV 约束选阈值(见 README)。
-    fpr_over_recall_cap = pi * (1 - tp) / (tp * (1 - pi))
-    need_fpr = fpr_over_recall_cap   # 保留变量名以兼容下游打印; 仅作参考上界
-        if need_fpr < 1.0 / n_valid_g:
-            note = 'FPR 需 <{:.2e}, 低于 valid 基因组阴性的分辨力(1/{:,})'.format(need_fpr, n_valid_g)
+        cap = pi * (1 - tp) / (tp * (1 - pi))
+        vpos = vp[vl == 1]
+        grid = np.sort(np.unique(np.quantile(vneg_g, 1 - np.geomspace(1e-2, 1.0 / n_valid_g, 400))))
+        hit = None
+        for thr in grid:                       # grid 升序 = 由松到严
+            f_v = float((vneg_g >= thr).mean())
+            r_v = float((vpos >= thr).mean())
+            if r_v <= 0:
+                continue
+            if f_v / r_v <= cap:
+                hit = (float(thr), f_v, r_v)
+                break
+        if hit is None:
+            note = ('valid 基因组阴性的分辨力(1/{:,})不足以定出满足 f/r<={:.2e} 的阈值'
+                    .format(n_valid_g, cap))
         else:
-            thr = float(np.quantile(vneg_g, 1 - need_fpr))
+            thr, f_v, r_v = hit
             k = int((neg >= thr).sum())
-            note = ('FPR 需 <{:.2e} → thr {:.4f}, 此时 recall {:.2%} '
-                    '(测试集实测 {} 个假阳)'.format(
-                        need_fpr, thr, float((pos >= thr).mean()), k))
+            note = ('thr {:.4f} (valid: FPR {:.2e}, recall {:.2%}, f/r {:.2e}<={:.2e}) '
+                    '→ 测试集 recall {:.2%}, 实测 {} 个假阳'
+                    .format(thr, f_v, r_v, f_v / max(r_v, 1e-12), cap,
+                            float((pos >= thr).mean()), k))
         L.append('{:12s}   要在 {:.0f}/百万 本底下拿到 PPV {:.0%}: {}'.format(
             m, pi * 1e6, tp, note))
         L.append('')
 
-    L += ['注 1: 审稿人假设的 1/百万 本底下, 所有方法单分子 PPV 都 <20% —— 这一点他说得对;',
+    L += ['注 1: 审稿人假设的 1/百万 本底下, 所有方法的单分子 PPV 都很低(见上表 PPV@1 列,',
+          '      论文正文按实测取整报为 <4%) —— 这一点他说得对;',
           '      75/百万是 esox 论文的 model-derived call rate, 不是实测丰度, 仅作情景假设。',
           '注 2: 本数据集覆盖度 ~0.16x(151 f5)/~1x(全量 959 f5), 位点级 k-of-n 聚合需 >=5x,',
           '      即每样本约 5,000 个 f5 = 5 张 flow cell → 该数据集不可行, 上表均为**单分子** PPV。',

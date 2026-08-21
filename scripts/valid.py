@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 import tqdm
 from dataset.dataset import PairDataset, MultiSimSampler, collate_fn, get_dataset, get_test_dataset, DEBASE_DICT
 from model.loss import FocalLoss
-from model.model import DetectModel
+from model.loader import KMER, build_model
 from pytorch_metric_learning import losses, miners, samplers
 from torch import nn
 import pandas as pd
@@ -50,7 +50,7 @@ BLUE = '\033[94m'
 GREEN = '\033[92m'
 
 
-def parse_data(batch: dict, device, kmers=5):
+def parse_data(batch: dict, device, kmers=KMER):
     signal = batch['signals'].to(device)
     original_kmer = batch['kmers'].to(device)
     kmer_len = original_kmer[0].shape[0] - kmers
@@ -105,12 +105,7 @@ def compute_metrics_from_confusion(TP, TN, FP, FN):
 
 
 def prediction(args: argparse.Namespace, resume, generate):
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "")
-    model = DetectModel(sig_blocks=4, sig_l=175, seq_l=7, pos_mode='rope')  # seq_l=7: Seq-Net 吃完整 7-mer(见 README).to(device)
-    if args.resume is not None:
-        model.load_state_dict(torch.load(resume, map_location=device),strict=False)
-    # os.makedirs(args.save_dir, exist_ok=True)
-    model.eval()
+    model, device = build_model(resume)
     test_dataset = get_test_dataset(args.test_pos_dir, args.test_neg_dir, args.test_work_dir,
                                     generate)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,
