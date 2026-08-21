@@ -19,32 +19,32 @@ negatives, and the output says so.
                   itself show that a read never spans two groups; that is a
                   property of the preprocessing, stated below.
 
-  [exact]         The training *positives* are enumerated.  ``pos_train.npz``
-                  was the array fed to the model, so its read IDs are the
-                  training positives, not a reconstruction.  Released as
-                  manifests/reads_train_pos.txt.gz.
+  [exhaustive]    Every read basecalled in every one of the 846 oligonucleotide
+                  groups, taken from the per-group basecall FASTQ rather than
+                  from the packed arrays: 2,683,085 train, 146,932 validation,
+                  148,225 test.  This covers reads whether or not they entered
+                  training, so it does not depend on which fields the packing
+                  step happened to retain.  All three sets are pairwise
+                  disjoint.  Released as manifests/oligo_all_reads_*.txt.gz.
 
-  [construction]  The training *negatives* cannot be enumerated: the packed
-                  negative training arrays kept only signal and summary
-                  features, and the intermediate per-read files were deleted
-                  after packing.  Their disjointness instead follows from how
-                  the split was made -- see manifests/split_manifest.json and
-                  dataset/build_split.py::assign_splits_oligo / _t2t.  Whole
-                  FAST5 directories (oligo) and whole npz parts (genomic) are
-                  assigned to exactly one of train/valid/test *before any read
-                  is read*.  A read exists in exactly one such file, so it
-                  cannot cross splits.  This argument covers every read,
-                  including those we did not archive; enumeration would only
-                  ever cover the ones we did.
+  [exact]         The training *positives* as fed to the model
+                  (manifests/reads_train_pos.txt.gz).  A subset of the above,
+                  checked separately because it is the set the model actually
+                  saw.
 
-  [independent]   A separate 13-mer feature extraction, run later over the same
-                  file-level partition, did keep read IDs.  Its training reads
-                  are reported here as a redundant check.  It is *not* the
-                  training set -- it drops 540 reads the 7-mer build kept and
-                  adds 420 it did not, because the two extractions apply
-                  different gap filters.  It is included as corroboration, not
-                  as provenance.  Requires the 13-mer archive and is skipped if
-                  absent.
+  [construction]  Genomic training negatives are the one set not enumerable
+                  here: the packed negative arrays kept only signal and summary
+                  features, and the source trees were deleted after packing.
+                  Their disjointness follows from the assignment itself -- see
+                  manifests/split_manifest.json and dataset/build_split.py.
+                  Whole FASTQ groups and whole npz parts go to exactly one
+                  subset *before any read is opened*, and a read belongs to
+                  exactly one group, so it cannot cross subsets.
+
+  [independent]   A later 13-mer extraction over the same partition retained
+                  read IDs and also shows no overlap.  It is corroboration, not
+                  provenance: it is a different extraction from the one used for
+                  training.  Requires the 13-mer archive; skipped if absent.
 """
 import gzip
 import os
@@ -108,15 +108,28 @@ def main():
     print('[manifest] split assignment, validated')
     man_ok = check_manifest()
 
-    print('[exact] training positives, enumerated from the packed training array')
-    tp = load('reads_train_pos.txt.gz')
-    print('    {:,} reads'.format(len(tp)))
-    pos_ok = report('positives', tp, ev)
+    print('\n[exhaustive] every read basecalled in the 846 oligonucleotide groups')
+    import glob
+    otr = set()
+    for f in sorted(glob.glob(os.path.join(M, 'oligo_all_reads_train_*.txt.gz'))):
+        otr |= load(os.path.basename(f))
+    oev = {sp: load('oligo_all_reads_{}.txt.gz'.format(sp)) for sp in ('valid', 'test')}
+    print('    train {:,} | valid {:,} | test {:,}'.format(
+        len(otr), len(oev['valid']), len(oev['test'])))
+    all_ok = report('oligo', otr, oev)
+    all_ok &= (len(oev['valid'] & oev['test']) == 0)
+    print('    valid n test          = {:>7,}'.format(len(oev['valid'] & oev['test'])))
+    all_ok &= report('oligo', otr, ev)
 
-    print('\n[construction] training negatives, not enumerable')
-    print('    Negative training read IDs were not archived.  Disjointness follows')
-    print('    from the file-level partition in manifests/split_manifest.json;')
-    print('    see the module docstring.  Nothing is asserted here.')
+    print('\n[exact] training positives, as fed to the model')
+    tp = load('reads_train_pos.txt.gz')
+    print('    {:,} reads, {:,} of them outside the exhaustive train set'.format(
+        len(tp), len(tp - otr)))
+    pos_ok = report('positives', tp, ev) and not (tp - otr)
+
+    print('\n[construction] genomic training negatives, not enumerable')
+    print('    Their read IDs were not archived.  Disjointness follows from the')
+    print('    assignment in manifests/split_manifest.json; nothing is asserted here.')
 
     print('\n[independent] separate 13-mer extraction over the same partition')
     k13_ok = None
@@ -136,16 +149,18 @@ def main():
     print()
     print('{} [manifest]:     released split assignment is well formed (seed 42, '
           'expected group counts).'.format('PASS' if man_ok else 'FAIL'))
-    print('{} [exact]:        no enumerated training-positive read appears in validation '
+    print('{} [exhaustive]:   the 2,683,085 oligonucleotide training reads are disjoint from '
+          'validation and test.'.format('PASS' if all_ok else 'FAIL'))
+    print('{} [exact]:        no training-positive read appears in validation '
           'or test.'.format('PASS' if pos_ok else 'FAIL'))
-    print('DOCUMENTED [construction]: training-negative disjointness follows from the released')
+    print('DOCUMENTED [construction]: genomic training-negative disjointness follows from the')
     print('           file and part assignment; a direct training-negative identifier')
     print('           intersection is unavailable and is not claimed.')
     print('{} [independent]: 13-mer corroboration{}'.format(
         'PASS' if k13_ok else ('SKIPPED' if k13_ok is None else 'FAIL'),
         ' archive not present.' if k13_ok is None else
         ' extraction shows no overlap.' if k13_ok else ' extraction shows overlap.'))
-    bad = (not man_ok) or (not pos_ok) or (k13_ok is False)
+    bad = (not man_ok) or (not pos_ok) or (not all_ok) or (k13_ok is False)
     return 1 if bad else 0
 
 

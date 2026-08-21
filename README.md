@@ -4,7 +4,7 @@ Code, trained weights and reproduction manifests for **"OxoNet: A Hybrid Deep Le
 Network for High-Specificity Detection of 8-oxo-dG from Nanopore Signals, with Evaluation
 on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-2026-24892).
 
-> The tag `v1.3-resubmission` is the immutable snapshot corresponding to the submitted
+> The tag `v1.4-resubmission` is the immutable snapshot corresponding to the submitted
 > manuscript. `main` may continue to receive documentation and bug fixes.
 >
 > Earlier tags are kept for provenance but should not be used. `v1.0` and `v1.1` instantiate
@@ -34,29 +34,19 @@ on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-202
 one-per-line lists.
 
 **Split evidence and direct intersection checks.** Run `python verify_read_disjoint.py` (CPU,
-seconds). It reports four layers of evidence separately rather than collapsing them, because they
-are not equally direct, and its closing lines are deliberately not a single global PASS:
+seconds). Assignment happens before feature extraction and each read belongs to exactly one group,
+so the split is read-disjoint by construction; the script checks it directly anyway:
 
-- *manifest* — the released assignment is well formed: seed 42, every entry labelled
-  train/valid/test, group counts 846 = 762/42/42 (oligo) and 315 = 283/16/16 (genomic). This
-  validates the manifest; it is not a read-identifier check.
-
-- *exact* — the training positives are enumerated (`reads_train_pos.txt.gz`, 454,984 reads,
-  taken from the array that was fed to the model). Their intersection with validation,
-  test-oligo and test-genomic is 0, 0, 0.
-- *by construction* — the training **negatives cannot be enumerated**: the packed negative
-  training arrays kept only signal and summary features, and the intermediate per-read files
-  were deleted after packing. Their disjointness follows instead from `split_manifest.json`
-  and `dataset/build_split.py`: whole FAST5 directories and whole npz parts are assigned to one
-  split *before any read is opened*, and a read lives in exactly one such file. This covers
-  every read, including unarchived ones — which enumeration never could.
-- *independent* — a later 13-mer extraction over the same partition did keep read IDs and also
-  gives 0, 0, 0. It is corroboration, not provenance: it drops 540 reads the 7-mer build kept
-  and adds 420 it did not, because the two extractions apply different gap filters. It needs
-  the 43 GB 13-mer archive, which is not redistributed, and is skipped when absent.
-
-On a fresh clone the 13-mer archive is absent, so what runs unaided is the manifest validation and
-the direct intersection over the training positives.
+- *exhaustive* — every read basecalled in the 846 oligonucleotide groups, read from the per-group
+  FASTQ rather than the packed arrays, so it does not depend on which fields packing retained:
+  2,683,085 train, 146,932 validation, 148,225 test, pairwise disjoint.
+- *exact* — the 454,984 training positives as fed to the model, all inside the exhaustive train
+  set and disjoint from every evaluation set.
+- *construction* — genomic training-negative read IDs were not archived (the packed negative arrays
+  kept only signal and summary features). For those reads the assignment in `split_manifest.json`
+  is the evidence; the script says so rather than implying a check it did not run.
+- *independent* — a later 13-mer extraction over the same partition also shows no overlap. Needs
+  the 43 GB archive, which is not redistributed, and is skipped when absent.
 
 - `valid_genomic_neg_mask.npy` — a **heuristically inferred** genomic-enriched validation mask. The
   packed validation data does not record the origin of each negative, so a negative is treated as
