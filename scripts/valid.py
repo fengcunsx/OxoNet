@@ -106,7 +106,7 @@ def compute_metrics_from_confusion(TP, TN, FP, FN):
 
 def prediction(args: argparse.Namespace, resume, generate):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "")
-    model = DetectModel(sig_blocks=4, sig_l=175, seq_l=5).to(device)
+    model = DetectModel(sig_blocks=4, sig_l=175, seq_l=7, pos_mode='rope')  # seq_l=7: Seq-Net 吃完整 7-mer(见 README).to(device)
     if args.resume is not None:
         model.load_state_dict(torch.load(resume, map_location=device),strict=False)
     # os.makedirs(args.save_dir, exist_ok=True)

@@ -434,24 +434,32 @@ def fig_genome():
 # --------------------------------------------------------------------------
 def fig_dala():
     """(a) 逐染色体 L vs D(OxoNet); (b) 三方效应量随工作点收紧的变化。"""
-    txt = open('/home/bio/8oxog/wtd1/dala_effect.txt', encoding='utf-8').read()
-    blocks = dict(re.findall(r'--- (\w+) ---\n(.*?)(?=\n--- |\Z)', txt, re.S))
     fig, axes = plt.subplots(1, 2, figsize=(W2, 2.5))
 
+    # (a) 六个样本级点(不是挑一对 run 的 23 条染色体) —— 避免 pseudo-replication 观感
     a = axes[0]
-    body = blocks['OxoNet'].strip().splitlines()
-    chrom = body[0].split()
-    L = np.array([float(x) for x in body[1].split()[1:]])
-    D = np.array([float(x) for x in body[2].split()[1:]])
-    a.scatter(L, D, s=16, color='#2a78d6', edgecolor='white', linewidth=0.5, zorder=3)
-    lim = [min(L.min(), D.min()) * 0.95, max(L.max(), D.max()) * 1.05]
-    a.plot(lim, lim, color=INK2, lw=0.8, ls='--', zorder=1)
-    a.text(lim[1] * 0.97, lim[0] * 1.02, 'no change', color=INK2, fontsize=7, ha='right')
-    a.set_xlim(lim); a.set_ylim(lim)
-    a.set_xlabel('Control (L-Ala), calls per million G')
-    a.set_ylabel('Induced (D-Ala), calls per million G')
-    a.set_title('(a) OxoNet, per chromosome, one run pair (23/23)', loc='left')
-    style(a)
+    L = {'wtl1': 245.7, 'wtl2': 190.3, 'p53l1': 286.6}
+    D = {'wtd1': 303.9, 'wtd2': 366.3, 'p53d1': 317.9}
+    for k, (lab, vals, x) in enumerate([('L-Ala', L, 0), ('D-Ala', D, 1)]):
+        for name, v in vals.items():
+            wt = not name.startswith('p53')
+            a.scatter(x + (np.random.default_rng(abs(hash(name)) % 999).uniform(-.07, .07)), v,
+                      s=46, marker='o' if wt else '^',
+                      color='#2a78d6' if wt else '#eb6834',
+                      edgecolor='white', linewidth=0.6, zorder=3)
+    # 不连配对线: 公开元数据只给出 L-1/L-2/D-1/D-2 这样的编号, 没有证据表明它们是
+    # 同一培养物/批次的一一配对。基因型是设计上平衡的, 配对不是。
+    a.plot([0, 1], [np.mean(list(L.values())), np.mean(list(D.values()))],
+           color=INK, lw=1.8, marker='_', ms=16, zorder=4)
+    a.set_xlim(-0.4, 1.4); a.set_xticks([0, 1]); a.set_xticklabels(['L-Ala', 'D-Ala'])
+    a.set_ylabel('OxoNet calls per million G')
+    a.set_title('(a) Six samples, three per condition', loc='left')
+    from matplotlib.lines import Line2D
+    a.legend(handles=[Line2D([], [], ls='none', marker='o', color='#2a78d6', ms=6, label='wild type'),
+                      Line2D([], [], ls='none', marker='^', color='#eb6834', ms=6, label='$p53^{-/-}$'),
+                      Line2D([], [], color=INK, lw=1.8, label='group mean')],
+             loc='upper left', fontsize=7)
+    style(a, 'y')
 
     b = axes[1]
     # 3L vs 3D 的比值(六个样本), 不是 wtl1-vs-wtd1 单对 —— 必须与正文一致

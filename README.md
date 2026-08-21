@@ -4,8 +4,10 @@ Code, trained weights and reproduction manifests for **"OxoNet: A Hybrid Deep Le
 Network for High-Specificity Detection of 8-oxo-dG from Nanopore Signals, with Evaluation
 on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-2026-24892).
 
-> The tag `v1.0-resubmission` is the immutable snapshot corresponding to the submitted
+> The tag `v1.2-resubmission` is the immutable snapshot corresponding to the submitted
 > manuscript. `main` may continue to receive documentation and bug fixes.
+> (`v1.0` and `v1.1` are earlier snapshots and contain known defects: inference entry points
+> instantiated with a 5-base sequence input, and a missing dataset package.)
 
 ## What is here
 
@@ -26,9 +28,13 @@ on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-202
 `(read_id, basecall_pos, label)`. These define the split exactly: the read-id sets of the
 three subsets are pairwise disjoint, which is the property the paper's leakage check verifies.
 
-- `valid_genomic_neg_mask.npy` — boolean mask marking which validation negatives are genomic
-  (as opposed to synthetic). **All decision thresholds in the paper are fixed on these**, never
-  on test data.
+- `valid_genomic_neg_mask.npy` — a **heuristically inferred** genomic-enriched validation mask. The
+  packed validation data does not record the origin of each negative, so a negative is treated as
+  genomic when its read contributes more than 100 candidate sites (`scripts/analysis/valid_neg_source.py`).
+  Varying that cut from 100 to 1000 moves recall at FPR 1e-4 by +1.07 points for OxoNet, +0.55 for
+  NanoCon-7, +0.29 for esox and +0.26 for the tree control.
+  **All primary comparative thresholds are fixed on this subset**, never on test data; the paper
+  additionally reports one exploratory native-calibrated point, which is labelled as such.
 - `valid_thresholds.json` — the thresholds and validation recalls per arm and operating point.
 - `pos_train_ctx.json` — the 100 guanine-centred 5-mer contexts that delimit which sites are
   interrogated at all.
@@ -43,6 +49,13 @@ PyTorch versions; the file lists those too, together with the upstream repositor
 
 Run `python reproduce_tables.py`. It reads only `predictions/` and `manifests/` and prints the
 recall columns of Tables 7 and 8 of the paper. No GPU, no weights and no raw data are needed.
+
+Run `python smoke_test.py` to check that the released checkpoint loads strictly into the 7-mer
+architecture and produces a forward pass. Also CPU-only.
+
+`scripts/analysis/make_figures.py` regenerates the figures, but it reads scoring outputs from paths
+on the machine where the analyses were run; it is released for inspection of how each figure was
+produced rather than as a turnkey pipeline.
 
 `predictions/` holds the scored probability of every arm on `test_oligo` and `test_t2t`, aligned
 row-for-row with `manifests/sites_test_*.csv.gz`. Combined with `manifests/valid_thresholds.json`
