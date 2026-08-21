@@ -42,9 +42,11 @@ so the split is read-disjoint by construction; the script checks it directly any
   2,683,085 train, 146,932 validation, 148,225 test, pairwise disjoint.
 - *exact* — the 454,984 training positives as fed to the model, all inside the exhaustive train
   set and disjoint from every evaluation set.
-- *construction* — genomic training-negative read IDs were not archived (the packed negative arrays
-  kept only signal and summary features). For those reads the assignment in `split_manifest.json`
-  is the evidence; the script says so rather than implying a check it did not run.
+- *part-level* — the reads observed in each of the 315 genomic extraction parts: 45,570 train,
+  2,836 validation, 2,576 test, pairwise disjoint, and **no read appears in two parts** — the
+  assumption the group-level assignment rests on. The exact genomic training-negative identifiers
+  were not archived (the packed negative arrays kept only signal and summary features), so this
+  layer is named for what it checks rather than claiming to be that set.
 - *independent* — a later 13-mer extraction over the same partition also shows no overlap. Needs
   the 43 GB archive, which is not redistributed, and is skipped when absent.
 

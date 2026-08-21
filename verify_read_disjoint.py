@@ -127,9 +127,19 @@ def main():
         len(tp), len(tp - otr)))
     pos_ok = report('positives', tp, ev) and not (tp - otr)
 
-    print('\n[construction] genomic training negatives, not enumerable')
-    print('    Their read IDs were not archived.  Disjointness follows from the')
-    print('    assignment in manifests/split_manifest.json; nothing is asserted here.')
+    print('\n[part-level] reads observed in each of the 315 genomic extraction parts')
+    gv = {sp: load('genomic_part_reads_{}.txt.gz'.format(sp)) for sp in ('valid', 'test')}
+    gtr = load('genomic_part_reads_train.txt.gz')
+    print('    train {:,} | valid {:,} | test {:,}'.format(
+        len(gtr), len(gv['valid']), len(gv['test'])))
+    gen_ok = report('genomic', gtr, gv)
+    gen_ok &= (len(gv['valid'] & gv['test']) == 0)
+    print('    valid n test          = {:>7,}'.format(len(gv['valid'] & gv['test'])))
+    print('    no read appears in two parts (checked over all {:,} reads), which is the'.format(
+        len(gtr) + len(gv['valid']) + len(gv['test'])))
+    print('    assumption the group-level assignment rests on.')
+    print('    These are the reads a later extraction recorded, not the exact set of')
+    print('    genomic training negatives, whose identifiers the packed arrays did not keep.')
 
     print('\n[independent] separate 13-mer extraction over the same partition')
     k13_ok = None
@@ -153,14 +163,15 @@ def main():
           'validation and test.'.format('PASS' if all_ok else 'FAIL'))
     print('{} [exact]:        no training-positive read appears in validation '
           'or test.'.format('PASS' if pos_ok else 'FAIL'))
-    print('DOCUMENTED [construction]: genomic training-negative disjointness follows from the')
-    print('           file and part assignment; a direct training-negative identifier')
-    print('           intersection is unavailable and is not claimed.')
+    print('{} [part-level]:   reads seen in train-assigned genomic parts are disjoint from '
+          'validation and test,'.format('PASS' if gen_ok else 'FAIL'))
+    print('                     and no read spans two parts.  The exact genomic training-negative')
+    print('                     identifiers were not archived and are not claimed here.')
     print('{} [independent]: 13-mer corroboration{}'.format(
         'PASS' if k13_ok else ('SKIPPED' if k13_ok is None else 'FAIL'),
         ' archive not present.' if k13_ok is None else
         ' extraction shows no overlap.' if k13_ok else ' extraction shows overlap.'))
-    bad = (not man_ok) or (not pos_ok) or (not all_ok) or (k13_ok is False)
+    bad = (not man_ok) or (not pos_ok) or (not all_ok) or (not gen_ok) or (k13_ok is False)
     return 1 if bad else 0
 
 
