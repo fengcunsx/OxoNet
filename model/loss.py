@@ -5,7 +5,7 @@ import torch.nn as nn
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.8, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
-        self.alpha = alpha  # 控制正负样本权重，>0.5 更重视负样本
+        self.alpha = alpha  # 正样本项的权重(见下式): >0.5 更重视正样本
         self.gamma = gamma  # 控制难易样本的聚焦程度
         self.reduction = reduction
 

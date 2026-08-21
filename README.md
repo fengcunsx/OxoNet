@@ -19,7 +19,7 @@ on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-202
 | Path | Contents |
 |---|---|
 | `model/` | OxoNet architecture (Sig-Net, Seq-Net, cross-attention fusion) |
-| `scripts/` | Training, epoch selection, prediction |
+| `scripts/` | Training, epoch selection, prediction (all inference paths go through `model/loader.py`) |
 | `scripts/analysis/` | Every script that produces a table or figure in the paper |
 | `scripts/nanocon_bench/` | NanoCon baseline: scoring and CSV conversion |
 | `scripts/train_curves/` | Per-epoch logs: OxoNet seeds 42/0/3407 and all five ablation arms (`*.tsv`), plus the three NanoCon-7 runs as TensorBoard event files |
@@ -33,9 +33,13 @@ on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-202
 `(read_id, basecall_pos, label)`; `manifests/reads_*.txt.gz` give the same read IDs as sorted
 one-per-line lists.
 
-**Checking the split for leakage.** Run `python verify_read_disjoint.py` (CPU, seconds). It
-reports three layers of evidence separately rather than collapsing them, because they are not
-equally direct:
+**Split evidence and direct intersection checks.** Run `python verify_read_disjoint.py` (CPU,
+seconds). It reports four layers of evidence separately rather than collapsing them, because they
+are not equally direct, and its closing lines are deliberately not a single global PASS:
+
+- *manifest* — the released assignment is well formed: seed 42, every entry labelled
+  train/valid/test, group counts 846 = 762/42/42 (oligo) and 315 = 283/16/16 (genomic). This
+  validates the manifest; it is not a read-identifier check.
 
 - *exact* — the training positives are enumerated (`reads_train_pos.txt.gz`, 454,984 reads,
   taken from the array that was fed to the model). Their intersection with validation,
@@ -50,6 +54,9 @@ equally direct:
   gives 0, 0, 0. It is corroboration, not provenance: it drops 540 reads the 7-mer build kept
   and adds 420 it did not, because the two extractions apply different gap filters. It needs
   the 43 GB 13-mer archive, which is not redistributed, and is skipped when absent.
+
+On a fresh clone the 13-mer archive is absent, so what runs unaided is the manifest validation and
+the direct intersection over the training positives.
 
 - `valid_genomic_neg_mask.npy` — a **heuristically inferred** genomic-enriched validation mask. The
   packed validation data does not record the origin of each negative, so a negative is treated as

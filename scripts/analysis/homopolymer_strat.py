@@ -1,4 +1,4 @@
-"""Homopolymer 分层: 中心 G 落在多长的连续 G 段里, 各方法表现如何。
+r"""Homopolymer 分层: 中心 G 落在多长的连续 G 段里, 各方法表现如何。
 
 直接答 R2.M1 举的例子 —— "a guanine homopolymer within a repetitive element may
 behave quite differently under native genomic sequencing conditions than in an

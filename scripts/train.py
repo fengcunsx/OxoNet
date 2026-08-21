@@ -117,7 +117,7 @@ def get_lr_lambda(current_step, warmup_steps, phase1_end_step, total_steps,
 
 def train(args: argparse.Namespace):
     set_seed(args.seed)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = DetectModel(sig_blocks=4, sig_l=175, seq_l=7, pos_mode='rope').to(device)
     os.makedirs(args.save_dir, exist_ok=True)
     # class_loss = nn.BCELoss()
