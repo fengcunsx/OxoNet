@@ -4,7 +4,7 @@ Code, trained weights and reproduction manifests for **"OxoNet: A Hybrid Deep Le
 Network for High-Specificity Detection of 8-oxo-dG from Nanopore Signals, with Evaluation
 on Genomic Negatives and Native Human DNA"** (IEEE Access, manuscript Access-2026-24892).
 
-> The tag `v1.4-resubmission` is the immutable snapshot corresponding to the submitted
+> The tag `v1.5-resubmission` is the immutable snapshot corresponding to the submitted
 > manuscript. `main` may continue to receive documentation and bug fixes.
 >
 > Earlier tags are kept for provenance but should not be used. `v1.0` and `v1.1` instantiate
